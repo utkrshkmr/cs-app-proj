@@ -1,0 +1,273 @@
+\chapter{Project 6: \code{servlet} --- a continuous-batching inference server}
+\label{ch:p6}
+
+\section{Goal}
+
+A C++20 server that exposes \code{cforward} + \code{pagedkv} over HTTP/1.1 with token streaming (server-sent events), built on a non-blocking \code{epoll} reactor, a thread pool, and an iteration-level (``continuous batching'') scheduler with chunked prefill, KV-block-aware admission, preemption, and prefix-sharing-aware batching. A load generator with Poisson arrivals and trace replay measures TTFT, TPOT, throughput and goodput under SLOs. The whole thing is race-free under ThreadSanitizer, its parser survives a fuzzer, and it ships with CI, versioned releases, and the other five projects as Git submodules.
+
+\begin{hook}
+This is a testbed for the scheduling and caching ideas in your inference research: when you later implement something in vLLM or SGLang, you will already have measured the elementary version here, where every queue and lock is yours. The multi-agent prefix-sharing experiment is the small-scale version of your cross-agent KV-reuse design.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{10.1}--10.5 Unix I/O, short counts, RIO & buffered reads on sockets; partial writes; backpressure \\
+\ch{10.8}--10.11 sharing files, redirection, standard I/O pitfalls & why not \code{FILE*} on sockets; \code{dup2} for log redirection \\
+\ch{11.1}--11.4 networking, sockets interface & listener, accept, address handling (\code{getaddrinfo}) \\
+\ch{11.5}--11.6 web servers, HTTP & the protocol state machine \\
+\ch{12.1}--12.2 process- and I/O-multiplexing-based concurrency & the reactor (\code{epoll} is \code{select} grown up) \\
+\ch{12.3}--12.5 threads, shared variables, semaphores & thread pool, queues, the \code{sbuf} pattern \\
+\ch{12.6} prethreading & the pool design \\
+\ch{12.7} thread safety, races, deadlocks & the TSan campaign; lock ordering \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Background}
+
+\subsection{Non-blocking I/O and the reactor}
+
+Sockets are set \code{O\_NONBLOCK}; \code{epoll\_create1}, \code{epoll\_ctl(ADD|MOD|DEL)}, \code{epoll\_wait}. With edge-triggered mode (\code{EPOLLET}) a readiness event is delivered once per transition, so the handler must drain until \code{EAGAIN}; level-triggered re-reports while data remains and is simpler but wakes more. Use edge-triggered for sockets and \code{EPOLLONESHOT} if several threads ever share an epoll set (they do not in this design). Watch \code{EPOLLRDHUP} to see half-closes.
+
+\textbf{Short counts are normal} (\ch{10.5}): one \code{read} returns whatever is in the kernel buffer; one request may arrive in ten reads, ten requests in one. The parser must be incremental (resumable state machine over a byte stream), and output must be queued: \code{write} may accept fewer bytes than offered, after which the connection registers \code{EPOLLOUT} and resumes when writable. \textbf{Backpressure}: cap the per-connection output queue (e.g.\ 1~MB); when exceeded, stop generating tokens for that request (mark it stalled) rather than growing memory. \textbf{Slow clients and idle connections}: a timer wheel or min-heap of deadlines serviced on each \code{epoll\_wait} timeout; close after 30~s idle. The classic denial-of-service against servers that lack this is slowloris; your load generator should include a slow-client mode to prove the defence.
+
+\textbf{Waking the reactor from other threads.} The engine thread finishes a step and has tokens to deliver, but the reactor is asleep in \code{epoll\_wait}. Register an \code{eventfd} in the epoll set; the engine pushes completions to a lock-free queue and writes 1 to the eventfd; the reactor drains the queue. This is the only cross-thread wake-up mechanism in the server.
+
+\subsection{HTTP/1.1 and SSE}
+
+Request: request line (\code{POST /v1/completions HTTP/1.1}), headers terminated by an empty line, body of \code{Content-Length} bytes (support \code{Transfer-Encoding: chunked} on input as a stretch). Parse as a state machine: \code{METHOD, PATH, VERSION, HEADER\_NAME, HEADER\_VALUE, CRLF, BODY, DONE}, with limits on line length (8~KB), header count (64), body size (1~MB); exceeding a limit yields \code{413}/\code{431} and closes. Response for streaming:
+\begin{lstlisting}[style=plain]
+HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n
+Connection: close\r\n\r\n
+data: {"token":" the","index":12}\n\n           ... one event per token ...
+data: {"done":true,"usage":{...}}\n\n
+\end{lstlisting}
+Non-streaming responses use \code{Content-Length}. Request bodies are JSON (\code{\{"prompt": "...", "max\_tokens": 64, "temperature": 0, "stream": true, "session": "agent-7"\}}); vendor a header-only JSON library or reuse your project-1 parser ported to C++.
+
+\subsection{Threads and queues (\ch{12.3}--12.7)}
+
+Threads: 1 reactor; 1 engine (runs forward passes; the only thread that touches model and KV state); $k$ tokenizer workers (BPE encode/decode is CPU work you do not want on the reactor); 1 metrics flusher. Queues between them: reactor$\to$tokenizers (MPMC or one SPSC per worker), tokenizers$\to$engine (MPSC), engine$\to$reactor (SPSC + eventfd).
+
+\textbf{Bounded SPSC ring buffer}, the workhorse: capacity $2^k$, \code{head} written only by the consumer, \code{tail} only by the producer; producer writes the slot then publishes \code{tail.store(t+1, release)}; consumer does \code{tail.load(acquire)} before reading the slot. The release/acquire pair makes the slot write visible before the index is observed---this is the memory-ordering argument you should be able to state in one sentence and TSan should be unable to refute. Mutex + condition variable is fine for MPMC queues at these rates; write the lock-free version only where profiling (project~3's tool) shows contention. Know the ABA problem and why bounded ring buffers with monotonically increasing indices avoid it.
+
+\textbf{Deadlock avoidance}: at most two locks ever held together, always in the same order (document the order in \code{docs/design.md}); never call out to user-supplied callbacks while holding a lock. \textbf{TSan} is run on the full server under load as part of \code{make BUILD=tsan test}.
+
+\subsection{Continuous batching}
+
+The engine loop runs \emph{iterations}; each iteration decides its batch from scratch (Orca-style iteration-level scheduling):
+\begin{lstlisting}[style=plain]
+loop:
+  budget = C tokens                                 # per-iteration token budget
+  # 1. decode first: every RUNNING sequence gets one token slot
+  batch = running; budget -= |running|
+  # 2. admit prefill work while budget and KV blocks allow
+  for req in waiting (FIFO, or prefix-affinity order):
+      m = radix.match(req.tokens)                   # cached prefix (P4)
+      need_tokens = min(budget, len(req) - m - req.prefilled)   # chunked prefill
+      need_blocks = blocks for (req.prefilled + need_tokens + 1) - blocks held
+      if need_tokens == 0 or pool.free < need_blocks + reserve: continue
+      allocate; batch += (req, need_tokens); budget -= need_tokens
+  # 3. if pool.free < |running| (cannot guarantee next decode step): preempt
+  while pool.free < |running| and running nonempty:
+      victim = youngest running (LIFO); free its blocks; (optionally swap to tier); move to waiting
+  # 4. run forward: prefill chunks + decode step in one pass over layers
+  step(batch)
+  # 5. finish: EOS or max_tokens -> release blocks, insert full blocks into radix tree
+  # 6. deliver tokens -> completion queue; eventfd signal
+\end{lstlisting}
+\textbf{Why the budget}: a 4K-token prefill would stall every running decode for the time of a 4K-token forward pass; chunking at $C$ (e.g.\ 512) bounds decode inter-token latency to the step time at $C$ tokens. \textbf{Why LIFO preemption}: the youngest sequence has the fewest tokens to recompute and has consumed the least service. \textbf{Prefix-affinity ordering}: among waiting requests, prefer those whose prefix match is longest (they need the least prefill), then group by shared prefix so a shared prefix enters the batch once (\code{servlet} with \code{pagedkv}'s refcounts makes this free).
+
+\subsection{Performance model}
+
+Decode step time with batch size $B$ on a bandwidth-bound machine is approximately
+\begin{equation}
+t(B) \approx t_w + B\,t_{\text{tok}},\qquad t_w = \frac{P b_w}{\beta},\quad t_{\text{tok}} \approx \frac{\text{KV bytes per sequence}}{\beta} + \text{per-token compute},
+\end{equation}
+so decode throughput $B/t(B)$ rises almost linearly while $B t_{\text{tok}} \ll t_w$ and saturates at $1/t_{\text{tok}}$: batching amortizes the weight read. Measure $t(B)$ for $B = 1..64$; the fitted $t_w$ should match project~2's bandwidth bound.
+
+\textbf{Metrics.} TTFT (request arrival to first token), TPOT or ITL (mean inter-token latency after the first), end-to-end latency, throughput (tokens/s, requests/s), and \emph{goodput}: requests/s whose TTFT $\le a$ and TPOT $\le b$. Report p50/p90/p99.
+
+\textbf{Queueing.} Little's law $N = \lambda W$ relates mean concurrency, arrival rate and mean latency, and is a consistency check on your measurements. For an M/M/1 reference, $W = 1/(\mu - \lambda)$ with utilization $\rho = \lambda/\mu$: latency diverges as $\rho\to1$. Your server has state-dependent service (bigger batches serve faster per request), so measure the latency--load curve empirically and locate the knee; compare with and without chunked prefill and with and without prefix caching.
+
+\textbf{Load generation.} Poisson arrivals: inter-arrival $\Delta = -\ln U/\lambda$, $U\sim\mathrm{Unif}(0,1]$. Prompt and output lengths from a trace (ShareGPT-style length distributions, or a synthetic lognormal); multi-agent workloads: $A$ agents each with a 1--2K-token system prompt shared by all their requests, interleaved. The generator is a separate C++ program using the same reactor code (a good test of its reuse), with an open-loop mode (arrivals independent of completions---the correct way to find the knee) and a closed-loop mode (fixed concurrency).
+
+\subsection{Tokenizer}
+
+Implement the \code{llama2.c} tokenizer: a vocabulary of byte-level pieces with scores; encode by splitting into UTF-8 bytes and repeatedly merging the adjacent pair with the highest score until none exists (greedy BPE, $O(n^2)$ naive, $O(n\log n)$ with a heap); decode by concatenating pieces and handling \code{<0xHH>} byte tokens. It is 150 lines and removes a Python dependency from the serving path.
+
+\section{Architecture}
+
+\begin{lstlisting}[style=plain]
+servlet/
+  third_party/   qnum/ cforward/ pagedkv/   (git submodules, pinned)
+  include/servlet/
+    net/reactor.hpp    epoll loop, Connection, timers, eventfd wakeup
+    net/buffer.hpp     growable byte buffer with consume/append (RIO in C++)
+    http/parser.hpp    incremental request parser; http/response.hpp; http/sse.hpp
+    sched/scheduler.hpp  Request, states (WAITING, RUNNING, PREEMPTED, DONE), the iteration algorithm
+    sched/policy.hpp   admission order, preemption victim selection, budget
+    engine/engine.hpp  wraps cforward+pagedkv; step(batch); owns the engine thread
+    engine/tokenizer.hpp
+    util/spsc.hpp util/mpmc.hpp util/metrics.hpp util/json.hpp
+  src/               main.cpp (config, wiring), one .cpp per header
+  bench/loadgen/     loadgen.cpp (open/closed loop, traces, multi-agent), report.py
+  tests/             test_parser.cpp test_reactor.cpp test_queues.cpp test_scheduler.cpp (fake engine)
+                     test_tokenizer.cpp test_e2e.py (black-box with python requests)
+  fuzz/              fuzz_parser.cpp (libFuzzer), corpus/
+  .github/workflows/ ci.yml  (gcc+clang, release+asan+tsan, tests, fuzz smoke, submodule checkout)
+\end{lstlisting}
+
+\begin{lstlisting}[style=cpp]
+// sched/scheduler.hpp (excerpt)
+struct Request {
+  uint64_t id; std::vector<int32_t> tokens; uint32_t prefilled = 0, generated = 0, max_tokens;
+  float temperature; bool stream; std::string session;      // prefix-affinity key
+  enum class State { Waiting, Running, Preempted, Done } state;
+  pk_table table; uint32_t cached_prefix = 0;
+  std::chrono::steady_clock::time_point t_arrival, t_first_token;
+};
+struct BatchItem { Request* req; uint32_t n_prefill_tokens; };  // 0 => one decode token
+class Scheduler {
+ public:
+  Scheduler(Policy p, pk_kv* kv, uint32_t token_budget, uint32_t reserve_blocks);
+  void submit(std::unique_ptr<Request>);                       // from tokenizer workers (MPSC)
+  std::vector<BatchItem> plan();                               // steps 1-3 of the loop
+  void commit(const std::vector<BatchItem>&, const StepResult&);   // steps 5-6
+  Stats stats() const;
+};
+
+// engine/engine.hpp
+struct StepResult { std::vector<std::pair<uint64_t,int32_t>> tokens; double step_ms; };
+class Engine { public: StepResult step(const std::vector<BatchItem>&); /* calls cforward over paged KV */ };
+
+// net/reactor.hpp
+class Reactor { public: void add(int fd, uint32_t events, Handler*); void run(); void wake(); /* eventfd */ };
+\end{lstlisting}
+
+Configuration via a TOML/JSON file and flags: model paths, \code{B}, pool size, huge pages, token budget $C$, reserve blocks, policy, port, threads.
+
+\section{Assignments}
+
+\assignment{A6.1}{Reactor, buffers, parser, a static endpoint}{14 h}
+\textbf{Goal.} An \code{epoll} server that survives 10K idle connections, slow clients and byte-at-a-time requests, serving \code{GET /healthz}.\\
+\textbf{Steps.} (1) \code{net/buffer.hpp}: growable byte buffer with \code{append}, \code{consume}, \code{peek}; the \code{read\_some}/\code{write\_some} helpers that treat \code{EAGAIN} and short counts correctly (unit tests with a mock fd). (2) \code{net/reactor.hpp}: listener with \code{SO\_REUSEADDR}, non-blocking accept loop, edge-triggered registration, per-connection handler object, \code{EPOLLOUT} on demand, deadline heap with \code{timerfd} or \code{epoll\_wait} timeout, \code{eventfd} wake. (3) \code{http/parser.hpp}: the incremental state machine with limits and status codes; \code{http/response.hpp}. (4) \code{tests/test\_parser.cpp} with the split-anywhere property; \code{fuzz/fuzz\_parser.cpp} with a seed corpus of 20 requests. (5) Python harness for the reactor tests (connections, slow client, half-close, fd-leak check). (6) \code{GET /healthz} returning JSON with uptime and connection count.\\
+\textbf{Acceptance.} Parser unit and property tests pass; 60-second fuzz run clean under ASan; reactor harness passes (10K idle connections, slowloris closed at timeout, no fd leak); ASan/UBSan clean.\\
+\textbf{Feeds.} Post~6 section 4 (short counts and the reactor), Post~6b's parser-fuzzing paragraph.
+
+\assignment{A6.2}{Tokenizer and a single-sequence completion}{8 h}
+\textbf{Goal.} \code{POST /v1/completions} non-streaming, one request at a time, through the real model.\\
+\textbf{Steps.} (1) \code{engine/tokenizer.hpp}: load \code{tokenizer.bin}, greedy BPE encode with a heap, decode with byte tokens; round-trip tests and the Python-reference comparison. (2) JSON request/response (vendor or port). (3) \code{Engine} wrapping \code{cforward} + \code{pagedkv} (submodules) with a single-sequence \code{generate}. (4) The endpoint, synchronous on the reactor thread for now (this is deliberately wrong; the next assignment fixes it and you will measure the difference).\\
+\textbf{Acceptance.} Tokenizer tests pass; a \code{curl} request returns the same text as \code{cforward}'s CLI for temperature 0; \code{healthz} is unresponsive during generation (observe and log it: that is the motivation for A6.3).\\
+\textbf{Feeds.} Post~6 section 3 (setup) and the ``why a separate engine thread'' sentence.
+
+\assignment{A6.3}{Engine thread, queues, streaming}{12 h}
+\textbf{Goal.} Token streaming over SSE with the model on its own thread, race-free under TSan.\\
+\textbf{Steps.} (1) \code{util/spsc.hpp}: bounded ring with release/acquire publication; \code{util/mpmc.hpp}: mutex+condvar queue; stress tests. (2) Tokenizer worker pool ($k$ threads) fed by the reactor. (3) Engine thread loop: pull requests, generate token by token, push completions, signal \code{eventfd}. (4) Reactor drains completions and writes SSE events; backpressure stalls generation for a slow client; \code{Connection: close} handling. (5) Lock-order documentation in \code{docs/design.md}. (6) TSan build under a 60-second load.\\
+\textbf{Acceptance.} Streaming works with \code{curl -N}; queue stress tests pass under TSan and \code{-O3}; the whole server under load has zero TSan reports; a slow client cannot grow memory beyond the per-connection cap (test).\\
+\textbf{Feeds.} Post~6 section 5 (threads and queues); all of Post~6b.
+
+\assignment{A6.4}{Continuous batching with chunked prefill}{14 h}
+\textbf{Goal.} The iteration-level scheduler with block-aware admission, and the $t(B)$ measurement.\\
+\textbf{Steps.} (1) \code{sched/scheduler.hpp}: \code{Request} states, \code{plan()} implementing steps 1--3 of the loop, \code{commit()} implementing 5--6; token budget $C$; reserve blocks. (2) \code{Engine::step} running prefill chunks and decode tokens in one pass over layers (batched matvec per sequence; prefill chunks via GEMM). (3) Fake engine for scheduler tests; the invariants and the chunked-vs-unchunked equality test. (4) \code{bench/batch\_step.cpp}: $t(B)$ for $B = 1..64$; fit $t_w$ and $t_{\text{tok}}$; compare $t_w$ to project~2's $Pb_w/\beta$.\\
+\textbf{Acceptance.} Scheduler tests pass; end-to-end determinism test passes; the $t(B)$ fit's $t_w$ is within 25\% of the project-2 bound; a plot of throughput vs $B$ saturating as predicted.\\
+\textbf{Feeds.} Post~6 Fig.~2 and section 6.
+
+\assignment{A6.5}{Preemption and prefix-affinity scheduling}{10 h}
+\textbf{Goal.} Correct behaviour when the pool fills; prefix-aware admission; the multi-agent benchmark.\\
+\textbf{Steps.} (1) Preemption by recompute (LIFO victim); then by swap to \code{pagedkv}'s tier; a policy switch. (2) Prefix-affinity ordering in \code{plan()} using \code{pk\_radix\_match} lengths and the session key. (3) Multi-agent workload in the load generator (A6.6 can be developed in parallel; the generator's trace mode is needed here). (4) Tests: preempted-then-resumed output identical; preemption count and recompute tokens reported in metrics.\\
+\textbf{Acceptance.} Preemption tests pass; under a deliberately undersized pool the server completes every request (slowly) rather than failing; prefix-affinity reduces prefilled tokens on the multi-agent workload by a measured amount reported in the README.\\
+\textbf{Feeds.} Post~6 section 7 (preemption) and Fig.~4.
+
+\assignment{A6.6}{Load generator and the latency--load study}{12 h}
+\textbf{Goal.} The curves that are the point of the project.\\
+\textbf{Steps.} (1) \code{bench/loadgen/loadgen.cpp} reusing the reactor: open-loop Poisson arrivals at rate $\lambda$, closed-loop at concurrency $N$, trace replay of (prompt length, output length, session) tuples; per-request TTFT/TPOT/E2E recorded to CSV. (2) \code{report.py}: percentiles, throughput, goodput under SLO pairs, Little's-law consistency check. (3) The sweep: $\lambda$ from low to past the knee, for four configurations (batching on/off, chunked prefill on/off, prefix cache on/off), 90~s each, release build, pinned cores. (4) Multi-agent sweep over number of agents. (5) \code{ltrace-ml} profile of the server under load at the knee.\\
+\textbf{Acceptance.} CSVs and plots in \code{docs/figures/}; the Little's-law check holds within 10\%; the knee is identified for each configuration; the profile attributes non-model time (JSON, tokenization, syscalls) with percentages.\\
+\textbf{Feeds.} Post~6 central figure (Fig.~1), Fig.~3--5, results.
+
+\assignment{A6.7}{CI, releases, submodules, back-porting}{10 h}
+\textbf{Goal.} Six repositories at tagged releases with green CI.\\
+\textbf{Steps.} (1) \code{ci.yml} per the Git lesson; nightly fuzz and load jobs. (2) Submodule pins updated to the other projects' release tags. (3) \code{CHANGELOG.md} from conventional commits. (4) Back-port \code{ci.yml} to projects 1--5; protect their \code{main} branches with the status check. (5) \code{gh release create v1.0.0} with the server binary and the load-generator binary. (6) The top-level \code{systems-from-csapp} README linking all six repos and all twelve posts.\\
+\textbf{Acceptance.} CI green on all six repos; \code{git clone --recurse-submodules} + \code{make test} works from scratch on a clean machine (test it in a container); releases published.\\
+\textbf{Feeds.} The series index page.
+
+\section{Test plan}
+
+\begin{description}
+  \item[Parser] Unit tests for every state; the \emph{split-anywhere} property: for a corpus of valid requests, feeding the bytes in every possible 2-way split (and random $k$-way splits) yields the identical parsed result; limits produce the right status codes; malformed inputs never crash. \code{fuzz/fuzz\_parser.cpp} with \code{clang -fsanitize=fuzzer,address} runs for 10 minutes in CI's nightly job and 30 seconds on every push.
+  \item[Buffer/RIO] Partial writes simulated with a mock fd that accepts $k$ bytes at a time; the queued output is delivered in order and completely.
+  \item[Reactor] Python test harness opens $N$ connections, sends requests byte-by-byte, half-closes, disconnects mid-stream; the server stays up, leaks no fds (\code{ls /proc/<pid>/fd | wc -l} before and after), and closes idle connections at the timeout.
+  \item[Queues] SPSC/MPMC stress tests: $10^7$ items, multiple producers/consumers, sequence numbers verified; run under TSan and with \code{-O3}.
+  \item[Scheduler with a fake engine] A deterministic fake engine (step time $= t_w + B t_{\text{tok}}$, tokens from a fixed sequence) makes the scheduler testable without a model: never exceeds the pool; token budget respected; FIFO among equals; preemption chooses the youngest; a preempted-then-resumed request produces exactly the same tokens as an unpreempted run; chunked prefill produces the same tokens as unchunked.
+  \item[End-to-end determinism] With temperature 0, a request's output is independent of what else is in the batch (true for matvec-per-sequence decode; document any deviation).
+  \item[Tokenizer] Round trip on a UTF-8 corpus (ASCII, accented, CJK, emoji, invalid bytes); encode equals the Python reference for 1000 strings.
+  \item[Load test as a test] A 60-second open-loop run at a fixed $\lambda$ below the knee must meet p99 TTFT and TPOT thresholds (soft, release build only, skipped in CI).
+  \item[Sanitizers] ASan+UBSan on all unit tests; TSan on the queue tests and on a 60-second load run.
+\end{description}
+
+\section{Measurements and blog briefs}
+
+(i) $t(B)$ with fitted $t_w$ vs project~2's bound; (ii) latency vs offered load, p50/p99 TTFT and TPOT, four configurations; (iii) goodput vs load under two SLO settings; (iv) prefix-cache hit rate and TTFT for the multi-agent workload vs number of agents; (v) preemption count and recompute overhead vs pool size; (vi) CPU profile of the server under load with \code{ltrace-ml}.
+
+\begin{blogbox}
+\post{6} \textbf{``Continuous batching from first principles: a CPU inference server you can read in an afternoon''}
+
+\textbf{Audience and thesis.} For people who run vLLM and tune \code{max-num-seqs} and \code{max-num-batched-tokens} without a model of what they do. Thesis: batching amortizes the weight read, chunking bounds latency, paging turns admission into a counting problem, and everything else is plumbing---and the plumbing is where the tail latency hides. Subtitle: ``$X$ req/s at p99 TTFT $< 500$~ms, $Y\times$ the single-sequence rate, on one CPU''.
+
+\textbf{Length.} 3000--3500 words.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} (central) p50 and p99 TTFT and TPOT ($y$, log) vs offered load $\lambda$ ($x$) for the four configurations; knees marked; the SLO lines drawn.
+  \item \fig{2} Decode step time $t(B)$ vs batch size with the linear fit and the project-2 $t_w$ bound; throughput $B/t(B)$ on a second axis saturating at $1/t_{\text{tok}}$.
+  \item \fig{3} TPOT histogram with and without chunked prefill at the same load (the long tail disappears).
+  \item \fig{4} Multi-agent: prefilled tokens per request and TTFT vs number of agents, prefix cache on/off.
+  \item \fig{5} Goodput vs load for two SLO pairs; the load at which goodput peaks vs the load at which throughput peaks.
+  \item \fig{6} Flame graph of the server at the knee (from \code{ltrace-ml}), model time collapsed, non-model time expanded.
+  \item \fig{7} Architecture diagram: reactor, tokenizer pool, engine, queues, \code{eventfd}; lock order annotated.
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: the four claims and the headline numbers.
+  \item Fig.~1 read configuration by configuration.
+  \item Setup: model, pool size, $B$, $C$, machine, how load was generated (open loop---say why), runs, tag.
+  \item Short counts shape everything: partial reads, partial writes, backpressure, the slowloris test; the incremental parser; 20 lines of the output queue.
+  \item Threads and queues (Fig.~7): why the model has one thread, the SPSC publish/consume pair with the memory-ordering sentence, the \code{eventfd} handshake.
+  \item The iteration loop in 25 lines; the $t(B)$ model and Fig.~2; ``batching amortizes the weight read'' with the fitted numbers.
+  \item Chunked prefill: the budget argument and Fig.~3; the cost (prefill takes more iterations).
+  \item Admission as counting: blocks needed vs free, the reserve, LIFO preemption and why.
+  \item Prefix-affinity scheduling and Fig.~4; the connection to the radix tree of post 4.
+  \item Goodput (Fig.~5) and Little's law as a sanity check on the whole measurement.
+  \item The profile (Fig.~6): where the non-model time goes, and the two fixes it motivated.
+  \item What went wrong: edge-triggered \code{epoll} without draining to \code{EAGAIN}; a deadlock from acquiring the metrics lock inside the scheduler lock (found by the lock-order rule, not by TSan); a load test that measured the load generator.
+  \item What this predicts: the same curves on a GPU with the numbers scaled; why vLLM's defaults sit where they do; what cross-agent prefix sharing is worth at scale; one prediction about p99 TTFT under chunked prefill for a given $C$ on an H100.
+  \item Reproduce box: two machines or two pinned core sets; 40 minutes for the full sweep.
+\end{enumerate}
+
+\textbf{Code to show.} The output-queue/\code{EPOLLOUT} logic; the SPSC pair; \code{plan()}; the Poisson inter-arrival line.
+
+\post{6b} \textbf{``Finding data races in a server with ThreadSanitizer, and the one that TSan could not see''}
+
+\textbf{Thesis.} TSan finds races in what runs; lock-order discipline finds deadlocks in what could run; both are necessary and neither is sufficient. \textbf{Length} 1400--1800 words. \textbf{Figures:} the lock-order graph for the server (nodes: locks; edges: acquisition order; must be acyclic); an annotated TSan report for a real race from your log; a diagram of the SPSC release/acquire pair with the happens-before edge drawn. \textbf{Outline:} what TSan instruments and what it costs (slowdown measured); three races it found in this server, each with the report excerpt and the fix; the release/acquire argument for the ring in one paragraph; the deadlock that TSan cannot see because the two acquisitions never overlapped in the test run, and the lock-order rule that catches it statically; what \code{helgrind} and \code{-fsanitize=thread} disagree on; reproduce box. \textbf{What went wrong:} suppressing a ``benign'' race on a statistics counter and later reading garbage percentiles---no race is benign in a report you will publish.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} submodules; CI with GitHub Actions; semantic versioning and CHANGELOG; releases with binaries; packfiles and \code{gc}.
+
+\textbf{Practice.}
+\begin{enumerate}
+  \item \code{git submodule add git@github.com:<user>/cforward third\_party/cforward} (and the others). The superproject records a \emph{commit hash} per submodule in a gitlink tree entry (\code{git ls-tree HEAD third\_party}) plus \code{.gitmodules}. Updating: \code{cd third\_party/cforward \&\& git fetch \&\& git checkout v0.2.1}, then commit the new pointer in the superproject. Fresh clones need \code{git clone --recurse-submodules} or \code{git submodule update --init --recursive}; CI must do this (\code{actions/checkout} with \code{submodules: recursive}). Know the alternative (\code{git subtree}) and why you chose submodules (independent release cadence, six separate blog-able repos).
+  \item CI (\code{.github/workflows/ci.yml}): matrix over \code{\{gcc, clang\}} $\times$ \code{\{release, asan, tsan\}}; steps: checkout with submodules, install deps, \code{make BUILD=\$\{\{ matrix.build \}\} test}, 30-second fuzz smoke, upload the test log as an artifact; a nightly job runs the 10-minute fuzz and the load test. Add the status badge to each README. Then back-port the workflow to projects 1--5 and make their \code{main} branches require it.
+  \item Semantic versioning: \code{MAJOR.MINOR.PATCH}; bump MINOR for features, PATCH for fixes, MAJOR for breaking API changes (relevant now that \code{servlet} depends on the others' headers). Maintain \code{CHANGELOG.md} in Keep-a-Changelog format, generated from conventional commits (\code{git log --pretty=format:'- \%s' v0.5.0..HEAD}) and edited by hand.
+  \item Release: \code{git tag -a v1.0.0 -m ...}, \code{git push --follow-tags}, \code{gh release create v1.0.0 --notes-file RELEASE\_NOTES.md build/release/servlet}. \code{git archive --format=tar.gz --prefix=servlet-1.0.0/ v1.0.0} produces a source tarball without \code{.git}.
+  \item Internals revisited: \code{git count-objects -v}, \code{git gc}, then look at \code{.git/objects/pack/}; \code{git verify-pack -v} shows delta chains---six months of history in a few megabytes, because blobs are delta-compressed against similar blobs. Compare with the loose-object count you recorded in project~1.
+  \item Final push checklist: all six repos at a tagged release, CI green, READMEs with headline figures, six blog posts linked from a top-level \code{systems-from-csapp} README that explains how the pieces fit.
+\end{enumerate}
+\end{gitbox}

@@ -1,0 +1,176 @@
+\chapter{Git command reference}
+\label{app:git}
+
+Grouped by the question you are asking. Each project's Git lesson introduces the commands in context; this is the lookup table afterwards.
+
+\section*{Inspecting}
+\begin{lstlisting}[style=sh]
+git status -sb                      # short status with branch/upstream
+git log --oneline --graph --decorate --all
+git log -p -- path                  # history of one file with diffs
+git log -S'needle' / -G'regex'      # commits that add/remove a string / match a regex in the diff
+git show <rev>[:path]               # a commit, or a file at a commit
+git diff / --staged / <a>..<b> / --stat
+git blame -w -C -C path             # ignore whitespace, follow moved code
+git cat-file -t|-p <hash>           # object type / pretty-print
+git ls-tree HEAD [path]             # tree entries (gitlinks for submodules)
+git reflog                          # where HEAD has been (local, expires)
+git describe --tags --dirty         # nearest tag + distance + hash
+git count-objects -v                # loose vs packed objects
+\end{lstlisting}
+
+\section*{Making commits}
+\begin{lstlisting}[style=sh]
+git add -p                          # stage hunks interactively
+git commit [-m msg] [--amend] [--fixup <rev>]
+git restore --staged path           # unstage (HEAD -> index)
+git restore path                    # discard working-tree change (index -> worktree)
+git rm --cached path                # stop tracking, keep file
+git stash push -m "msg" / list / pop / drop
+\end{lstlisting}
+
+\section*{Branches and history surgery}
+\begin{lstlisting}[style=sh]
+git switch -c name [start]          # create+switch; git switch - toggles
+git branch -d name / -D             # delete merged / force
+git merge --ff-only other           # refuse to create a merge commit
+git merge --no-ff other             # always create one
+git rebase main                     # replay branch onto main
+git rebase -i main                  # pick/reword/edit/squash/fixup/drop
+git rebase --onto main A B          # transplant commits (A, B] onto main
+git rebase --autosquash             # apply --fixup commits automatically
+git cherry-pick <rev>...            # copy commits onto current branch
+git revert <rev>                    # new commit undoing <rev> (safe on public history)
+git reset --soft|--mixed|--hard <rev>   # move branch; keep index / keep worktree / discard
+git range-diff main old new         # compare two versions of a series
+git bisect start [bad] [good]; git bisect run script   # exit 0 good, 1 bad, 125 skip
+git worktree add ../dir branch / list / remove
+git config rerere.enabled true      # reuse recorded conflict resolutions
+\end{lstlisting}
+
+\section*{Remotes}
+\begin{lstlisting}[style=sh]
+git remote -v / add origin url / set-url origin url
+git fetch [--prune] [--tags]        # update remote-tracking refs, never touches your branches
+git pull --rebase                   # fetch + rebase (set pull.rebase=true)
+git push -u origin branch           # set upstream on first push
+git push --force-with-lease         # safe force: refuses if remote moved
+git push --follow-tags              # push annotated tags reachable from pushed commits
+git push origin --delete branch
+\end{lstlisting}
+
+\section*{Tags, releases, submodules}
+\begin{lstlisting}[style=sh]
+git tag -a v1.2.0 -m "..."          # annotated (object); git tag v1.2.0 is lightweight (ref only)
+gh release create v1.2.0 --generate-notes [files...]
+git archive --format=tar.gz --prefix=name-1.2.0/ v1.2.0 > name-1.2.0.tar.gz
+git submodule add url path; git submodule update --init --recursive
+git submodule status; git submodule foreach 'git fetch'
+git clone --recurse-submodules url
+\end{lstlisting}
+
+\section*{Hooks, attributes, signing}
+\begin{lstlisting}[style=sh]
+git config core.hooksPath .githooks       # versioned hooks
+git config gpg.format ssh; git config user.signingkey ~/.ssh/id_ed25519.pub
+git config commit.gpgsign true
+# .gitattributes:  * text=auto eol=lf   |  *.bin binary   |  path linguist-language=Python
+\end{lstlisting}
+
+\chapter{Performance measurement cheat sheet}
+\label{app:perf}
+
+\begin{lstlisting}[style=sh]
+# Allow perf for non-root (per boot):  sudo sysctl kernel.perf_event_paranoid=1
+perf stat -e cycles,instructions,cache-misses,cache-references,\
+  L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses,page-faults -r 5 ./bench
+perf record -g --call-graph fp ./bench     # frame-pointer call graphs (why -fno-omit-frame-pointer)
+perf report --no-children --sort sym
+perf annotate <symbol>                     # instruction-level hot spots
+perf list | grep -i -e tlb -e fma          # available events on this CPU
+valgrind --tool=cachegrind --cache-sim=yes ./bench ; cg_annotate cachegrind.out.*
+objdump -d -M intel --no-show-raw-insn -S build/release/x.o | less
+# Pin and quiet the machine for microbenchmarks:
+taskset -c 2 ./bench ;  echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+\end{lstlisting}
+
+\textbf{Reporting rules used throughout.} Report the median of $\ge 5$ runs and the spread; state the build flags, the commit (\code{git describe}), and the machine (\code{docs/machine.md}); plot the bound you derived next to the measurement; never report a speedup without the absolute numbers it came from.
+
+\textbf{Cycle counting.} \code{rdtsc} counts at a constant reference frequency, not core cycles; calibrate against \code{clock\_gettime(CLOCK\_MONOTONIC)} once at startup and convert to nanoseconds, or use \code{perf\_event\_open} with \code{PERF\_COUNT\_HW\_CPU\_CYCLES} for true cycles (project~2's \code{roofline.h}). Warm up before timing; time enough iterations to exceed 100~ms; subtract loop overhead measured with an empty body.
+
+\chapter{Reference constants}
+\label{app:consts}
+
+\section*{Bit patterns (hexadecimal)}
+\begin{center}\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & fp32 & fp16 & bf16 & E5M2 & E4M3 \\
+\midrule
+$+0$ & \code{00000000} & \code{0000} & \code{0000} & \code{00} & \code{00} \\
+$+1.0$ & \code{3F800000} & \code{3C00} & \code{3F80} & \code{3C} & \code{38} \\
+max finite & \code{7F7FFFFF} & \code{7BFF} & \code{7F7F} & \code{7B} & \code{7E} \\
+min normal & \code{00800000} & \code{0400} & \code{0080} & \code{04} & \code{08} \\
+min subnormal & \code{00000001} & \code{0001} & \code{0001} & \code{01} & \code{01} \\
+$+\infty$ & \code{7F800000} & \code{7C00} & \code{7F80} & \code{7C} & --- \\
+canonical NaN & \code{7FC00000} & \code{7E00} & \code{7FC0} & \code{7E} & \code{7F} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{Transformer configurations for testing}
+\begin{center}\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+Model & $d$ & $L$ & $h$ & $h_{kv}$ & $F$ & $V$ & $\theta_0$ \\
+\midrule
+\code{stories15M} (llama2.c) & 288 & 6 & 6 & 6 & 768 & 32000 & 10000 \\
+\code{stories110M} & 768 & 12 & 12 & 12 & 2048 & 32000 & 10000 \\
+TinyLlama-1.1B & 2048 & 22 & 32 & 4 & 5632 & 32000 & 10000 \\
+Llama-3-8B & 4096 & 32 & 32 & 8 & 14336 & 128256 & 500000 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{x86-64 System V register roles}
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Integer arguments 1--6 & \code{rdi rsi rdx rcx r8 r9} \\
+Return & \code{rax} (\code{rdx} for 128-bit) \\
+Callee-saved & \code{rbx rbp r12 r13 r14 r15} (and \code{rsp}) \\
+Caller-saved & \code{rax rcx rdx rsi rdi r8--r11}, all \code{xmm/ymm/zmm} \\
+FP arguments / return & \code{xmm0--7} / \code{xmm0} \\
+Stack alignment at \code{call} & 16 bytes; red zone 128 bytes below \code{rsp} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{Register numbers for encoding}
+\code{rax}=0, \code{rcx}=1, \code{rdx}=2, \code{rbx}=3, \code{rsp}=4, \code{rbp}=5, \code{rsi}=6, \code{rdi}=7, \code{r8}--\code{r15}=8--15 (REX.\code{B}/\code{R}/\code{X} set for 8--15). \code{ymm0}--\code{ymm15} likewise. Note \code{rsp} as \code{rm=100} means ``SIB follows'' and \code{rbp} as \code{base=101} with \code{mod=00} means ``no base, disp32'' (RIP-relative in 64-bit mode when \code{rm=101}, \code{mod=00}); both need special-casing in the encoder.
+
+\chapter{Blog series overview}
+\label{app:blog}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}c>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.38\textwidth}@{}}
+\toprule
+\# & Post & Central figure \\
+\midrule
+1 & Every inference number format, from the bits up & SQNR vs bits/weight, all formats, real weights \\
+1b & Verifying a float converter against all four billion inputs & runtime and findings of the exhaustive sweep \\
+2 & A roofline for LLM decode, measured from scratch on one CPU core & roofline with the optimization ladder \\
+2b & Online softmax, explained with one invariant & ULP distance online vs offline \\
+3 & What does PyTorch actually ask the CUDA runtime for? & cudaMalloc/launch timeline \\
+3b & A sampling profiler is a statistics problem & estimate vs truth with confidence intervals \\
+4 & Paging a KV cache on a CPU: what the TLB thinks of PagedAttention & latency vs pool size, 4K vs 2M pages \\
+4b & Belady's MIN for KV blocks: how far is LRU from optimal? & miss ratio vs pool size, LRU/LFU/OPT \\
+5 & An AVX2 JIT for fused tensor ops in 2000 lines of C & fused speedup across the cache hierarchy \\
+5b & How I test a code generator & (method post; table of oracles) \\
+6 & Continuous batching from first principles & latency vs load, four configurations \\
+6b & Finding data races in a server with ThreadSanitizer & (method post; the lock-order diagram) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Each post follows the same shape: the figure first, the mechanism that explains it second, the code third, and a ``what this predicts elsewhere'' paragraph last (GPUs, Tenstorrent, the serving stack you actually use). Link every post to the tagged release that produced its numbers.

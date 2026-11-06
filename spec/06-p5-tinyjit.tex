@@ -1,0 +1,304 @@
+\chapter{Project 5: \code{tinyjit} --- an AVX2 JIT compiler for fused tensor operations}
+\label{ch:p5}
+
+\section{Goal}
+
+A small compiler, in C, from a tensor-expression IR (elementwise arithmetic, transcendental approximations, reductions over fp32 arrays, and the quantize/dequantize operations of project~1) to x86-64 AVX2 machine code generated at run time into executable memory and called through a function pointer. It performs operator fusion (one loop, no intermediate arrays), linear-scan register allocation over the 16 \code{ymm} registers, vectorized main loop with a masked tail, and a constant pool addressed RIP-relatively---which means you compute a relocation by hand. As a stretch, the same code generator writes a relocatable ELF object file that \code{gcc} can link, closing the loop with \csapp\ chapter~7.
+
+\begin{hook}
+This is the last mile of every DL compiler (XLA, TVM, Triton's CPU backend, Tenstorrent's TT-MLIR lowering to kernels): an expression DAG becomes a loop nest becomes instruction bytes, and register pressure and memory traffic decide performance. Doing it for AVX2 removes every abstraction between you and the numbers, and the fused-vs-unfused measurement is the elementary case of the fusion decisions those compilers make.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{3.2}--3.6 instruction formats, operands, control & the encoder; loop structure; condition codes for \code{jb} \\
+\ch{3.7} procedures, the x86-64 calling convention & your kernel's ABI (\code{rdi}, \code{rsi}, \ldots; callee-saved set) \\
+\ch{3.11} floating-point code, SIMD registers & \code{ymm} usage, \code{vzeroupper} \\
+\ch{7.4}--7.7 ELF sections, symbols, relocations & the constant pool (\code{R\_X86\_64\_PC32} arithmetic); the \code{.o} writer \\
+\ch{8.5} signals & catching \code{SIGSEGV}/\code{SIGILL} from a bad encoding in a forked test child \\
+\ch{9.8} \code{mmap}, protections & W$\oplus$X: write, then \code{mprotect} to execute \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Background}
+
+\subsection{The IR}
+
+A kernel is a DAG of nodes over a single implicit loop index $i\in[0,n)$:
+\begin{itemize}
+  \item \code{Arg(k)}: the $k$-th pointer argument, read as a vector of 8 floats at $i$.
+  \item \code{Const(c)}: a broadcast fp32 constant.
+  \item Binary \code{Add, Sub, Mul, Div, Max, Min}; unary \code{Neg, Abs, Sqrt, Rsqrt, Exp, Recip, Floor}; \code{FMA(a,b,c)} $= ab+c$.
+  \item \code{Select(mask, a, b)} and comparisons \code{CmpLT, CmpGE} producing lane masks.
+  \item \code{Store(k, v)}: write $v$ to argument $k$ at $i$.
+  \item \code{ReduceSum(v)}, \code{ReduceMax(v)}: accumulate across the loop; written to a scalar output after the loop.
+  \item Integer ops needed for the quantizers: \code{CvtF2I} (\code{vcvtps2dq}, with rounding mode), \code{CvtI2F}, \code{ShlI}, \code{AndI}, \code{OrI}, \code{AddI}.
+\end{itemize}
+The generated function has the fixed signature
+\begin{lstlisting}[style=c]
+typedef void (*tj_kernel)(float *const *args, size_t n, float *reduce_out);
+\end{lstlisting}
+so that every kernel is called the same way; \code{args[k]} is loaded into a register once in the prologue.
+
+Two-pass operations (RMSNorm: a reduction followed by an elementwise pass that uses it) are expressed as two kernels, or one kernel with a \code{Pass2} barrier node that splits the loop in two; start with two kernels and measure whether the fused two-pass version (second loop re-reads $x$ while it is still in cache for $n \le$ L2) is worth it.
+
+\subsection{Lowering to a loop}
+
+\begin{lstlisting}[style=plain]
+prologue: load args[k] into GPRs (rdi points at args; r8..r11, rbx.. as needed)
+          rcx = 0 (index); rdx = n & ~7 (vector bound)   # or lea rdx, [rsi-7] and use jb
+          zero reduction accumulators
+loop:     if rcx >= rdx goto tail
+          for node in topo_order: emit(node)             # vector body, 8 lanes
+          rcx += 8; goto loop
+tail:     if rcx == n goto done
+          build lane mask for (n - rcx) lanes; emit body with vmaskmovps loads/stores
+done:     horizontal-reduce accumulators -> reduce_out[j]
+          vzeroupper; ret
+\end{lstlisting}
+Unroll the vector body $U=2$--$4$ times (independent iterations) when register pressure allows: the reduction accumulators then split into $U$ chains (project~2's lesson).
+
+\subsection{Register allocation}
+
+The body is straight-line code per iteration, so live ranges are intervals $[\text{def}, \text{last use}]$ in topological order and linear scan is optimal enough: walk nodes in order; at each definition, free registers whose interval ended; if none is free, spill the live value with the \emph{furthest} next use to a stack slot (\code{vmovups [rsp+off], ymm}) and reload on use. Reserve \code{ymm15} for the tail mask and \code{ymm14} as a scratch for two-operand idioms. Constants are loaded with \code{vbroadcastss} from the pool at each use unless there is a free register (hoist loop-invariant constants into registers in the prologue when pressure is low). Track and print the maximum pressure per kernel; it is a useful column in the benchmark table.
+
+\subsection{The System V x86-64 calling convention (\ch{3.7})}
+
+Integer/pointer arguments arrive in \code{rdi, rsi, rdx, rcx, r8, r9}; floating-point in \code{xmm0--7}; return in \code{rax}/\code{xmm0}. Callee-saved: \code{rbx, rbp, r12--r15} (and \code{rsp}); everything else, including \emph{all} vector registers, is caller-saved, so a leaf kernel may use \code{ymm0--15} freely. The stack must be 16-byte aligned at a \code{call}; on entry \code{rsp} is therefore $\equiv 8 \pmod{16}$. Spill slots must be 32-byte aligned for \code{vmovaps} (or use \code{vmovups}, which tolerates misalignment at a small cost); allocate with \code{sub rsp, S} and restore before \code{ret}. The 128-byte red zone below \code{rsp} may be used without adjusting \code{rsp} in a leaf function. Emit \code{vzeroupper} before returning: mixing dirty upper \code{ymm} halves with legacy SSE code in the caller costs a transition penalty on Intel cores.
+
+\subsection{Instruction encoding}
+
+An x86-64 instruction is: legacy prefixes, then either a REX prefix (\code{0100WRXB}) or a VEX prefix, the opcode (1--3 bytes), ModRM, optional SIB, optional displacement, optional immediate.
+
+\textbf{ModRM} $=$ \code{mod(2) reg(3) rm(3)}: \code{mod=11} means \code{rm} is a register; \code{mod=00} with \code{rm=100} means a SIB byte follows; \code{mod=00}, \code{rm=101} means RIP-relative with a 32-bit displacement; \code{mod=01}/\code{10} add an 8/32-bit displacement. \textbf{SIB} $=$ \code{scale(2) index(3) base(3)} with scale $2^{\text{scale}}$. REX bits \code{R}, \code{X}, \code{B} extend \code{reg}, \code{index}, \code{base} to 4 bits (registers 8--15); \code{W} selects 64-bit operand size.
+
+\textbf{VEX} (used by every AVX instruction). Two-byte form \code{C5} $[\bar{R}\,\bar{v}_3\bar{v}_2\bar{v}_1\bar{v}_0\,L\,p_1p_0]$ for the \code{0F} opcode map with \code{X=B=0}, \code{W=0}; three-byte form \code{C4} $[\bar{R}\bar{X}\bar{B}\,m_4..m_0]$ $[W\,\bar{v}_3..\bar{v}_0\,L\,p_1p_0]$ where \code{mmmmm} selects the opcode map (\code{00001}: \code{0F}, \code{00010}: \code{0F38}, \code{00011}: \code{0F3A}). $\bar{v}$ is the \emph{inverted} second source register; $L=1$ selects 256-bit; \code{pp} encodes an implied prefix (\code{00}: none, \code{01}: \code{66}, \code{10}: \code{F3}, \code{11}: \code{F2}). The bars mean the bits are stored inverted.
+
+\textbf{Worked example.} \code{vaddps ymm0, ymm1, ymm2} is \code{VEX.256.0F 58 /r}: two-byte VEX; $\bar R=1$ (no extension), $\bar{v} = \overline{0001} = 1110$ (ymm1), $L=1$, $pp=00$ $\Rightarrow$ \code{1\,1110\,1\,00 = F4}; opcode \code{58}; ModRM \code{11\,000\,010 = C2} (reg$=$ymm0 destination, rm$=$ymm2). Bytes: \code{C5 F4 58 C2}. For \code{vfmadd231ps ymm0, ymm1, ymm2} (\code{VEX.256.66.0F38 B8 /r}): \code{C4}; $\bar R\bar X\bar B = 111$, map \code{00010} $\Rightarrow$ \code{E2}; $W=0$, $\bar v = 1110$, $L=1$, $pp=01$ $\Rightarrow$ \code{0\,1110\,1\,01 = 75}; opcode \code{B8}; ModRM \code{C2}. Bytes: \code{C4 E2 75 B8 C2}.
+
+\textbf{Reference encodings} (all verified with GNU \code{as}; your encoder tests reproduce these and the assembler is the oracle for everything else):
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Instruction & Bytes \\
+\midrule
+\code{vmovups ymm0, [rdi+rcx*4]}            & \code{C5 FC 10 04 8F} \\
+\code{vmovups [rdx+rcx*4], ymm0}            & \code{C5 FC 11 04 8A} \\
+\code{vaddps/vmulps/vsubps/vdivps/vmaxps ymm0,ymm1,ymm2} & \code{C5 F4 \{58|59|5C|5E|5F\} C2} \\
+\code{vfmadd231ps ymm0, ymm1, ymm2}         & \code{C4 E2 75 B8 C2} \\
+\code{vbroadcastss ymm3, [rip+disp32]}      & \code{C4 E2 7D 18 1D} \emph{disp32} \\
+\code{vxorps ymm0, ymm0, ymm0}              & \code{C5 FC 57 C0} \\
+\code{vrsqrtps ymm0, ymm1} / \code{vsqrtps} & \code{C5 FC 52 C1} / \code{C5 FC 51 C1} \\
+\code{vcvtps2dq ymm0, ymm1} / \code{vcvtdq2ps} & \code{C5 FD 5B C1} / \code{C5 FC 5B C1} \\
+\code{vpaddd ymm0, ymm1, ymm2}              & \code{C5 F5 FE C2} \\
+\code{vpslld ymm0, ymm1, 23}                & \code{C5 FD 72 F1 17} \\
+\code{vroundps ymm0, ymm1, imm8}            & \code{C4 E3 7D 08 C1} \emph{imm8} \\
+\code{vmaskmovps ymm0, ymm1, [rdi+rcx*4]}   & \code{C4 E2 75 2C 04 8F} \\
+\code{vmaskmovps [rdx+rcx*4], ymm1, ymm0}   & \code{C4 E2 75 2E 04 8A} \\
+\code{vextractf128 xmm1, ymm0, 1}           & \code{C4 E3 7D 19 C1 01} \\
+\code{vhaddps xmm0, xmm0, xmm0}             & \code{C5 FB 7C C0} \\
+\code{vmovss [rdx], xmm0}                   & \code{C5 FA 11 02} \\
+\code{xor ecx, ecx} / \code{add rcx, 8} / \code{cmp rcx, rdx} & \code{31 C9} / \code{48 83 C1 08} / \code{48 39 D1} \\
+\code{jb rel32} / \code{jmp rel32}          & \code{0F 82} \emph{rel32} / \code{E9} \emph{rel32} \\
+\code{mov rax, [rdi+8]} / \code{lea rax, [rdx-7]} & \code{48 8B 47 08} / \code{48 8D 42 F9} \\
+\code{vzeroupper} / \code{ret}              & \code{C5 F8 77} / \code{C3} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Changing a register changes the obvious 3-bit field (and a REX/VEX extension bit for registers 8--15); derive the general encoder from these and test it against the assembler for every register combination (Section~\ref{sec:p5tests}).
+
+\textbf{Branch displacements and the constant pool are relocations.} A \code{jb rel32} at address $p$ with target $t$ has displacement $t - (p + 6)$: target minus the address of the \emph{next} instruction. A RIP-relative \code{vbroadcastss} of a constant at pool address $S$ from an instruction occupying $[p, p+9)$ has $\text{disp32} = S - (p+9)$. In \csapp's notation this is $S + A - P$ with $A = -4$ (the displacement field's own size) and $P$ the address of the displacement field: $S - 4 - (p+5) = S - (p+9)$. Emit the loop with forward branches patched after the target is known (a tiny two-pass or back-patch assembler), and place the pool after \code{ret}, 32-byte aligned, patching each use once the pool address is fixed.
+
+\subsection{Executable memory}
+
+\code{mmap(NULL, size, PROT\_READ|PROT\_WRITE, MAP\_PRIVATE|MAP\_ANONYMOUS, -1, 0)}; write code and pool; \code{mprotect(PROT\_READ|PROT\_EXEC)}; cast to \code{tj\_kernel}. Never map \code{PROT\_WRITE|PROT\_EXEC} (W$\oplus$X; some hardened kernels refuse). x86 keeps instruction and data caches coherent for self-modifying code at the page level once protections change, so no cache flush is required (ARM would need \code{\_\_builtin\_\_\_clear\_cache}; say so in a comment---your GB10 machine is ARM, so the \emph{structure} of the JIT should admit a second backend even if you never write it).
+
+\subsection{Transcendentals in SIMD}
+
+\textbf{exp.} Range-reduce $x = k\ln 2 + r$ with $k = \round(x/\ln 2)$ (\code{vroundps} mode 0) and $|r| \le \tfrac{\ln 2}{2}\approx 0.3466$. Approximate $e^r$ by a degree-5 or 6 polynomial; the Taylor remainder bound is $|r|^6/720 \approx 2.4\times10^{-6}$ relative for degree 5, while a minimax fit on $[-\ln2/2, \ln2/2]$ (fit the coefficients with a least-squares or Remez script in \code{scripts/}) reaches $\sim 2\times 10^{-7}$. Evaluate with Horner's scheme ($p = c_5$; $p = p r + c_4$; \ldots; five dependent FMAs). Reconstruct $2^k$ by integer arithmetic: $\text{bits} = (k + 127) \ll 23$ (\code{vcvtps2dq}, \code{vpaddd}, \code{vpslld}), then multiply. Clamp $x$ to $[-87.3, 88.7]$ first to keep $k+127\in[0,255]$. Accuracy test target: $\le 2$ ULP vs \code{expf}.
+
+\textbf{rsqrt.} \code{vrsqrtps} gives $\approx 12$ bits; one Newton step $y' = y\,(1.5 - 0.5\,x\,y^2)$ gives $\approx 23$ bits (three FMAs). Division: \code{vdivps} has latency $\sim 11$--$13$ cycles and throughput of one per 5 cycles on 256-bit; \code{vrcpps} + one Newton step $y' = y(2 - xy)$ is faster if many divisions are in flight. Offer both and measure.
+
+\textbf{SiLU.} $\silu(x) = x/(1 + e^{-x})$ composed from the above; for RMSNorm, $\text{rsqrt}(\text{mean}(x^2) + \epsilon)$ is a scalar broadcast between the two passes.
+
+\textbf{Horizontal reductions.} After the loop, each accumulator \code{ymm} holds 8 partial sums: \code{vextractf128} the high half, \code{vaddps} the two \code{xmm}s, then two \code{vhaddps} (or a shuffle sequence) to get the scalar in lane 0; \code{vmovss} it out. The order of this reduction fixes the floating-point result; document it and keep it stable across versions so that tests can be bit-exact.
+
+\subsection{Why fusion pays}
+
+An unfused chain of $k$ elementwise operations over $n$ floats moves roughly $12n$ bytes per operation (two reads, one write) $\Rightarrow 12kn$ bytes. The fused kernel moves $4n(n_{\text{in}} + n_{\text{out}})$. For $n$ larger than L2 both are bandwidth-bound and the speedup bound is $3k/(n_{\text{in}}+n_{\text{out}})$; below L2 the unfused version's intermediates hit in cache and the gap narrows to instruction overhead. Plot speedup vs $n$ across the cache boundaries; it is the fusion decision rule every compiler implements, measured.
+
+\subsection{Writing a relocatable ELF object (stretch)}
+
+Sections: \code{.text} (the code), \code{.rodata} (the pool), \code{.symtab}, \code{.strtab}, \code{.shstrtab}, \code{.rela.text}. Symbols: one \code{STT\_FUNC}, \code{STB\_GLOBAL} per kernel in \code{.text}; one \code{STT\_SECTION} for \code{.rodata}. Each pool reference becomes a relocation \code{R\_X86\_64\_PC32} with \code{r\_offset} at the disp32 field, symbol \code{.rodata}, addend $= \text{pool offset} - 4$. Then \code{gcc main.c kernel.o} links it and \code{readelf -r kernel.o} shows exactly the relocation you computed by hand in the JIT. The ELF64 header, section header table, and \code{Elf64\_Sym}/\code{Elf64\_Rela} layouts are in \code{<elf.h>}; write them with plain structs.
+
+\section{Architecture}
+
+\begin{lstlisting}[style=plain]
+tinyjit/
+  include/tinyjit/
+    ir.h        node arena, builder API (tj_arg, tj_const, tj_add, ..., tj_store, tj_reduce_sum)
+    asm.h       byte buffer, label/patch list, encoder functions (one per instruction form)
+    regalloc.h  linear scan over the IR, spill slots, pressure stats
+    codegen.h   lowering: IR -> asm buffer (prologue, loop, tail, epilogue, pool)
+    jit.h       tj_compile(graph) -> tj_kernel + metadata; tj_release
+    elfout.h    (stretch) write .o
+    interp.h    reference interpreter for the IR (scalar, double precision internally)
+  src/          ir.c asm.c regalloc.c codegen.c jit.c elfout.c interp.c mathlib.c (poly coefficients)
+  tests/        test_asm.c (vs assembler goldens) test_regalloc.c test_codegen.c test_math.c test_fuzz.c test_elf.c
+  bench/        fused_vs_unfused.c (rmsnorm, silu-gate, quantize) vs -O3 C vs numpy
+  scripts/      asm_golden.py (emits .s, assembles, dumps bytes -> tests/golden/*.bin), fit_exp_poly.py
+\end{lstlisting}
+
+\begin{lstlisting}[style=c]
+/* ir.h */
+typedef struct tj_graph tj_graph;  typedef uint32_t tj_val;
+tj_graph *tj_graph_new(int n_args);
+tj_val tj_arg(tj_graph*, int k);           tj_val tj_const(tj_graph*, float c);
+tj_val tj_add(tj_graph*, tj_val, tj_val);  /* sub mul div max min fma ... */
+tj_val tj_exp(tj_graph*, tj_val);          tj_val tj_rsqrt(tj_graph*, tj_val);
+tj_val tj_cvt_f2i(tj_graph*, tj_val, int rounding);  tj_val tj_shl_i(tj_graph*, tj_val, int);
+void   tj_store(tj_graph*, int k, tj_val);
+int    tj_reduce_sum(tj_graph*, tj_val);   /* returns index into reduce_out */
+
+/* jit.h */
+typedef struct { tj_kernel fn; void *mem; size_t code_bytes; int max_pressure, spills; } tj_compiled;
+int  tj_compile(const tj_graph*, tj_compiled *out, int unroll);
+void tj_release(tj_compiled*);
+void tj_dump(const tj_compiled*, FILE*);   /* hex bytes; pipe into objdump -D -b binary -m i386:x86-64 */
+
+/* interp.h */
+void tj_interpret(const tj_graph*, float *const *args, size_t n, float *reduce_out);
+
+/* asm.h (excerpt) */
+typedef struct { uint8_t *buf; size_t len, cap; /* patches */ } tj_asm;
+typedef int tj_label;
+void tj_vaddps(tj_asm*, int dst, int src1, int src2);
+void tj_vmovups_load(tj_asm*, int dst, int base, int index, int scale, int32_t disp);
+void tj_vbroadcastss_rip(tj_asm*, int dst, tj_label pool_const);
+tj_label tj_label_new(tj_asm*);  void tj_label_bind(tj_asm*, tj_label);
+void tj_jb(tj_asm*, tj_label);   void tj_jmp(tj_asm*, tj_label);
+int  tj_asm_finalize(tj_asm*);   /* resolve all patches; error if any unbound */
+\end{lstlisting}
+
+\section{Assignments}
+
+\assignment{A5.1}{The encoder, golden-tested against the assembler}{10 h}
+\textbf{Goal.} Byte-exact encoders for every instruction form in the reference table, for all register combinations.\\
+\textbf{Steps.} (1) \code{asm.h}: byte buffer, \code{emit8/32}, label and patch list, \code{finalize}. (2) Write the VEX helpers: a function that produces the 2-byte or 3-byte prefix from (map, pp, W, L, vvvv, R, X, B), choosing the 2-byte form whenever legal. (3) ModRM/SIB/displacement helper handling the \code{rsp}/\code{rbp} special cases and disp8 vs disp32 selection. (4) One encoder per instruction form in the table. (5) \code{scripts/asm\_golden.py}: for each form, enumerate operands, emit a \code{.s} file, assemble with \code{as}, extract bytes with \code{objcopy -O binary} or \code{objdump}, write \code{tests/golden/<form>.bin} plus an index. (6) \code{tests/test\_asm.c} replays the index. (7) \code{tj\_dump} and the \code{objdump -D -b binary -m i386:x86-64} round trip documented in the README.\\
+\textbf{Acceptance.} Every golden case byte-equal (several thousand cases); label tests pass; \code{tj\_dump} output disassembles to what you emitted.\\
+\textbf{Feeds.} Post~5 section 5 (one instruction decoded bit by bit); all of Post~5b.
+
+\assignment{A5.2}{IR, interpreter, first kernel}{8 h}
+\textbf{Goal.} \code{y = a*b + c} compiled and running from JIT memory.\\
+\textbf{Steps.} (1) \code{ir.h}: node arena, builder functions, topological order. (2) \code{interp.c}: scalar interpreter computing in double, rounding to float at stores. (3) \code{codegen.c}: prologue (load arg pointers), vector loop with fixed register assignment (no allocator yet), scalar tail loop using \code{xmm} forms (add the scalar encoders to A5.1's golden set), epilogue. (4) \code{jit.c}: \code{mmap}, copy, \code{mprotect}, cast; \code{tj\_release}. (5) Forked-child test execution in \code{ck.h}. (6) Tests for the three ops at all tail lengths.\\
+\textbf{Acceptance.} \code{a*b+c} matches the interpreter for all listed $n$; a deliberately corrupted byte in the test produces ``SIGILL in test X'' rather than a runner crash; W$\oplus$X respected (never \code{PROT\_WRITE|PROT\_EXEC}).\\
+\textbf{Feeds.} Post~5 sections 3--4 (IR, loop shape).
+
+\assignment{A5.3}{Register allocation, masked tail, unrolling, fuzzing}{12 h}
+\textbf{Goal.} Arbitrary DAGs compile correctly under register pressure.\\
+\textbf{Steps.} (1) \code{regalloc.c}: live intervals from the topological order; linear scan; spill slot assignment in the stack frame (32-byte aligned via \code{and rsp, -32} after saving \code{rbp}); pressure and spill statistics. (2) Constant pool after \code{ret}, RIP-relative \code{vbroadcastss}, patched at finalize---this is the relocation computation; write it as $S + A - P$ in the code comment. (3) Masked tail with \code{vmaskmovps} and a mask table in the pool (8 masks of 8 lanes). (4) Unrolling by $U$ with accumulator splitting for reductions; horizontal reduction epilogue. (5) \code{tests/test\_fuzz.c}: random DAG generator with a seed, including deep chains that force spills; page-boundary placement for tail safety. (6) Determinism test.\\
+\textbf{Acceptance.} $10^4$ fuzz cases pass under ASan; spilling cases pass; page-boundary tail test passes; bytes deterministic.\\
+\textbf{Feeds.} Post~5 sections 6--7 (linear scan, constant pool as relocation), Fig.~3.
+
+\assignment{A5.4}{Transcendentals and the fusion benchmark}{12 h}
+\textbf{Goal.} \code{exp}, \code{rsqrt}, \code{recip} to spec; RMSNorm and SiLU-gate kernels replacing \code{cforward}'s; the fused-vs-unfused figure.\\
+\textbf{Steps.} (1) \code{scripts/fit\_exp\_poly.py}: least-squares (or Remez) coefficients for $e^r$ on $[-\ln 2/2, \ln 2/2]$, degrees 4--6, with max relative error reported. (2) Lower \code{Exp}: clamp, $k = \round(x/\ln 2)$, Horner, exponent reconstruction via integer ops. (3) \code{Rsqrt} with one Newton step; \code{Recip} via \code{vrcpps}+Newton and via \code{vdivps} as a switch. (4) ULP tests against \code{expf}, $1/\sqrt{x}$, $1/x$ over $10^7$ random inputs across the full range; histogram output. (5) RMSNorm as two kernels (reduce; scale) and as one two-pass kernel; SiLU-gate. (6) Plug into \code{cforward} behind a build flag; end-to-end golden test still passes. (7) \code{bench/fused\_vs\_unfused.c}: SiLU-gate chain of 4 ops, $n$ from $2^{10}$ to $2^{26}$, fused JIT vs unfused JIT vs \code{-O3} C vs \code{-O3 -ffast-math} C; GB/s and speedup; mark cache boundaries.\\
+\textbf{Acceptance.} \code{exp} $\le 2$ ULP, \code{rsqrt}/\code{recip} $\le 1$ ULP after Newton (document any exception near the clamp limits); \code{cforward} goldens pass with JIT kernels; fusion figure shows the bandwidth-bound regime beyond L2 with speedup near the $3k/(n_{\text{in}}+n_{\text{out}})$ bound.\\
+\textbf{Feeds.} Post~5 central figure (Fig.~1), Fig.~4, sections 8--9.
+
+\assignment{A5.5}{Integer ops and quantizer kernels}{8 h}
+\textbf{Goal.} JIT-generated conversions that are bit-identical to \code{qnum}.\\
+\textbf{Steps.} (1) Integer node types and encoders (\code{vpaddd}, \code{vpslld}, \code{vpsrld}, \code{vpand}, \code{vpor}, \code{vcvtps2dq} with rounding via \code{vroundps}). (2) fp32$\to$bf16 RNE as a graph (the Equation~\eqref{eq:rne} expression in vector integer ops) storing packed 16-bit results (requires \code{vpackusdw} + \code{vpermq}, add to the golden set). (3) int8 symmetric group quantize: per-group max via a reduction kernel, then scale/round/clamp/pack. (4) Tests against \code{qnum} over $2^{24}$ random inputs; stress on NaN/Inf inputs.\\
+\textbf{Acceptance.} Bit-identical to \code{qnum} for bf16 (all finite inputs; NaNs map to a NaN) and int8; throughput vs \code{qnum}'s intrinsics path reported.\\
+\textbf{Feeds.} Post~5 results (one paragraph: ``the quantizer from post 1, now emitted by the compiler from post 5'').
+
+\assignment{A5.6}{Stretch: relocatable ELF object}{8 h}
+\textbf{Goal.} \code{tinyjit} writes a \code{.o} that \code{gcc} links; \code{readelf -r} shows your relocations.\\
+\textbf{Steps.} (1) \code{elfout.c}: ELF header, section headers, \code{.text}, \code{.rodata}, \code{.symtab}, \code{.strtab}, \code{.shstrtab}, \code{.rela.text}; one global function symbol per kernel; \code{R\_X86\_64\_PC32} for each pool reference with addend $-4$ plus pool offset. (2) A test that writes the object, links it with a C driver, runs it, compares with the JIT version. (3) \code{docs/elf-notes.md}: \code{readelf -S/-s/-r} output annotated against the fields you wrote.\\
+\textbf{Acceptance.} \code{readelf} parses without warnings; linked kernel equals JIT kernel; the notes map each relocation to the JIT's patch.\\
+\textbf{Feeds.} Post~5 section 10.
+
+\section{Test plan}
+\label{sec:p5tests}
+
+\begin{description}
+  \item[Encoder goldens] \code{scripts/asm\_golden.py} generates, for every encoder function, every (dst, src1, src2) register triple in $0..15$ and every (base, index) GPR pair with displacements $\{0, 8, -7, 0x100, -0x100\}$, assembles them with \code{as}, and stores the bytes. The test asserts byte equality. This is a few thousand cases and runs in under a second.
+  \item[Labels and patches] Forward and backward branches at distances $< 128$ and $> 128$ bytes (you emit rel32 always, so the test asserts the displacement arithmetic); unbound label is a compile error, not a crash.
+  \item[Codegen vs interpreter] For each IR op, random inputs, $n \in \{0, 1, 7, 8, 9, 15, 16, 17, 1000, 1023, 1024, 1025\}$: fp32 results equal the interpreter's (which computes in double and rounds once) within 1~ULP for arithmetic, 2~ULP for \code{exp}, 1~ULP for \code{rsqrt} after Newton.
+  \item[Fuzz] Generate 10$^4$ random DAGs (depth $\le 12$, up to 6 args, random stores and reductions); JIT vs interpreter; include graphs that force spilling (more than 16 live values). Run with ASan: out-of-bounds writes past \code{out[n]} are detected because the test allocates exactly $n$ floats with a red zone.
+  \item[Crash isolation] Tests that execute JIT code run in a forked child; \code{SIGSEGV}/\code{SIGILL} is reported as a failure of that case (this is why \code{ck.h} forks from project~3 on).
+  \item[Masked tail] The tail never reads or writes beyond $n$: verified with page-boundary placement (\code{mmap} two pages, make the second \code{PROT\_NONE}, put the array flush against the boundary).
+  \item[Determinism] Compiling the same graph twice yields identical bytes; the reduction order is fixed, so \code{ReduceSum} is bit-identical run to run.
+  \item[Quantizer kernels] JIT fp32$\to$bf16 RNE equals \code{qn\_f32\_to\_bf16} for $2^{24}$ random inputs; int8 group quantize equals \code{qnum} exactly.
+  \item[ELF] \code{readelf -r} parses the output; \code{gcc} links it; the linked kernel equals the JIT kernel on random inputs.
+\end{description}
+
+\section{Measurements and blog briefs}
+
+(i) Fused vs unfused vs \code{-O3} C (\code{-ffast-math} and not) vs NumPy, speedup vs $n$ with L1/L2/L3 boundaries marked; (ii) register pressure and spills per kernel; (iii) effect of unroll factor on reductions; (iv) \code{exp} accuracy histogram in ULPs and throughput vs \code{expf}; (v) compile time per kernel; (vi) JIT quantizer throughput vs \code{qnum}.
+
+\begin{blogbox}
+\post{5} \textbf{``An AVX2 JIT for fused tensor ops in 2000 lines of C''}
+
+\textbf{Audience and thesis.} For people who use \code{torch.compile} or Triton and think of code generation as something that happens in a 100k-line project. Thesis: the last mile of a DL compiler is short---an expression DAG, a loop, a register allocator, an encoder---and the piece that feels most mysterious (placing a constant) is the relocation formula from the linking chapter. Subtitle: ``fused SiLU-gate at $X$~GB/s vs $Y$~GB/s unfused beyond L2; compile time $Z\,\mu$s''.
+
+\textbf{Length.} 3000--3500 words.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} (central) Speedup of fused over unfused ($y$) vs array size $n$ (log $x$) for the SiLU-gate chain, with L1/L2/L3 sizes as vertical lines and the bandwidth-bound speedup limit dashed; second panel with absolute GB/s for fused, unfused, \code{-O3} C, \code{-O3 -ffast-math} C.
+  \item \fig{2} The byte-level decode of \code{vaddps ymm0, ymm1, ymm2}: a boxed diagram of \code{C5 F4 58 C2} with every bit field labelled.
+  \item \fig{3} Live-interval diagram for a 10-node DAG with the linear-scan assignment to \code{ymm} registers; a second DAG with a spill.
+  \item \fig{4} ULP-error histogram of the JIT \code{exp} vs \code{expf} over the full range; throughput bar next to it.
+  \item \fig{5} The constant pool as a relocation: a diagram of the instruction at $p$, the displacement field at $P$, the constant at $S$, and $S + A - P$.
+  \item \fig{6} \code{readelf -r} output of the emitted \code{.o} next to the JIT's patch log for the same kernel.
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: what gets compiled, how fast, how small the compiler is.
+  \item Fig.~1 and the one-sentence reason (bytes moved).
+  \item Setup: machine, compilers compared, tag.
+  \item The IR and the loop shape; why one implicit loop index is enough for this class of kernels and what it cannot express (gathers, matmul).
+  \item One instruction, decoded (Fig.~2): REX/VEX, ModRM, SIB, the inverted \code{vvvv}, the opcode maps. Then the general encoder in 30 lines and the sentence ``the assembler is the oracle''.
+  \item The calling convention as a contract: which registers you may clobber, why the kernel is a leaf, \code{vzeroupper}.
+  \item Linear scan in 60 lines (Fig.~3): intervals, furthest-next-use spilling, pressure numbers for the real kernels.
+  \item The constant pool as a relocation (Fig.~5): $S + A - P$ derived, the back-patch, and the same arithmetic for branches.
+  \item \code{exp} with range reduction: the polynomial fit, exponent reconstruction by integer ops (code), Fig.~4; \code{rsqrt} and Newton.
+  \item The fusion measurement (Fig.~1 again): the $12kn$ vs $4n(n_{\text{in}}+n_{\text{out}})$ arithmetic, cache-resident regime vs bandwidth regime, and what \code{-ffast-math} buys the C compiler and why.
+  \item The ELF writer and Fig.~6: what a linker sees is what you computed.
+  \item What went wrong: the \code{rbp}-as-base encoding trap; a spill slot misaligned by 16 (\code{vmovaps} fault only on some inputs); forgetting \code{vzeroupper} and the 10$\times$ slowdown in the caller's SSE code.
+  \item What this predicts: what changes for AVX-512 (masks, 32 registers) and for NEON on the GB10 (no lane masks; scalar tails); why Triton's CPU backend and TVM make the same fusion decision; one prediction about where \code{torch.compile}'s fused elementwise kernels will and will not beat eager on this machine.
+  \item Reproduce box.
+\end{enumerate}
+
+\textbf{Code to show.} The VEX prefix builder; the furthest-next-use spill choice; the \code{exp} lowering; the relocation patch; 10 lines of the ELF \code{Elf64\_Rela} setup.
+
+\post{5b} \textbf{``How I test a code generator''}
+
+\textbf{Thesis.} A code generator is testable to a very high standard with four oracles---the system assembler, an interpreter, a forked crash sandbox, and a page boundary---and none of them needs a framework. \textbf{Length} 1400--1800 words. \textbf{Figures:} a table of oracles (what each catches, cost, example bug); the fuzz-case count vs bugs-found curve from your log (bugs plateau early---say when). \textbf{Outline:} assembler goldens (the enumeration script, how many cases, runtime); the interpreter as a numerics oracle and why it computes in double; forked execution and signal reporting (code from \code{ck.h}); the page-boundary trick for tail safety; determinism as a test; what remains untested (encodings you never emit, ABI assumptions in callers); reproduce box. \textbf{What went wrong:} a golden test that passed because the script assembled the wrong operand order---how a bit-field diagram caught what the test did not.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} automated bisection; \code{range-diff}; \code{rerere}; \code{describe}; signed commits.
+
+\textbf{Practice.}
+\begin{enumerate}
+  \item Write \code{scripts/check.sh}: builds and runs the encoder goldens and the fuzz test with a fixed seed; exits 0/1 (exit 125 if the build fails, which tells bisect to skip). Then \code{git bisect start HEAD v0.4.0 \&\& git bisect run scripts/check.sh}. Plant a one-byte encoding bug in a middle commit to try it. This only works because every commit builds and passes---the discipline from project~1.
+  \item After rewriting a branch with \code{rebase -i}, compare old and new series with \code{git range-diff main old-tip new-tip} before force-pushing; it shows which commits changed and how.
+  \item \code{git config rerere.enabled true}: recorded conflict resolutions replay automatically when you rebase the same branch repeatedly.
+  \item \code{git describe --tags --dirty} gives \code{v0.5.0-12-gabc1234-dirty}; bake it into \code{tj\_dump}'s header via a \code{-DTJ\_VERSION} define generated by the Makefile, so every benchmark output names the exact commit.
+  \item Sign commits with your SSH key: \code{git config gpg.format ssh}, \code{git config user.signingkey \~{}/.ssh/id\_ed25519.pub}, \code{git config commit.gpgsign true}; add the key as a signing key on GitHub and verify the ``Verified'' badge.
+  \item Tag \code{v0.5.0} at A5.5.
+\end{enumerate}
+\end{gitbox}

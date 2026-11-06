@@ -1,0 +1,295 @@
+\chapter{Project 4: \code{pagedkv} --- a memory allocator and a paged KV cache with prefix caching}
+\label{ch:p4}
+
+\section{Goal}
+
+Two layers. First, a general-purpose dynamic memory allocator (\csapp's Malloc Lab done to completion: segregated explicit free lists, boundary-tag coalescing, in-place \code{realloc}, measured throughput and utilization against glibc). Second, built on \code{mmap}'d memory and the same design ideas, a vLLM-style paged KV-cache manager: fixed-size blocks, per-sequence block tables, reference counting with copy-on-write for forked sequences, a radix tree over token prefixes for prefix caching, pluggable eviction policies, and a cold tier on disk. The attention kernel from project~2 is adapted to read K/V through block tables, and TLB behaviour with 4~KB vs 2~MB pages is measured.
+
+\begin{hook}
+This is the data structure behind PagedAttention and SGLang's RadixAttention. Building it with a replacement-policy analysis attached lets you ask the operating-systems question---how far is a practical eviction policy from the offline optimum?---for KV blocks instead of pages, and the capacity-limited block pool is the same object as the memory bank in your memory-slot experiments.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{9.1}--9.6 address spaces, page tables, TLBs & the huge-page experiment; TLB reach arithmetic \\
+\ch{9.7} case study: Core i7 address translation & interpreting \code{dTLB-load-misses} \\
+\ch{9.8} memory mapping, \code{mmap}, copy-on-write & the block pool; cold tier via file mapping; COW analogy \\
+\ch{9.9} dynamic memory allocation & the allocator (all of it) \\
+\ch{9.10}--9.11 garbage collection, memory bugs & reference counting; the shadow checker in tests \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Mathematical background}
+
+\subsection{Allocator design}
+
+\textbf{Block format.} Alignment 16. Header word: \code{size | prev\_alloc << 1 | alloc} (the low 4 bits of a 16-aligned size are free). Allocated blocks: header + payload (no footer, since the next block's \code{prev\_alloc} bit replaces it---this saves 8 bytes per block). Free blocks: header, \code{pred}/\code{succ} pointers, padding, footer. Minimum block: $8 + 8 + 8 + 8 = 32$ bytes. Block size for a payload request $r$:
+\begin{equation}
+\text{bsize}(r) = \max\big(32,\ \lceil (r + 8)/16 \rceil \cdot 16\big).
+\end{equation}
+
+\textbf{Segregated free lists.} Size classes $\{32, 48, 64, 96, 128, 192, 256, \dots\}$---powers of two with a midpoint in each binade---up to 4~KB, then one list per power of two to 1~MB, then one oversize list. Class index from \code{\_\_builtin\_clzl}: for size $s$, let $k = 63 - \mathrm{clz}(s)$; the midpoint test is bit $k-1$. Placement: first fit in the request's class, then the next classes; split when the remainder $\ge 32$; the remainder goes to its class (LIFO insertion).
+
+\textbf{Coalescing} on free with boundary tags: four cases (neither neighbour free; next free; prev free; both), using the \code{prev\_alloc} bit to avoid reading the previous block's footer unless it is free. Immediate coalescing keeps fragmentation low; deferred coalescing is faster---measure both.
+
+\textbf{realloc.} Shrink in place; grow in place if the next block is free and large enough (or is the epilogue and the heap can extend); otherwise allocate-copy-free.
+
+\textbf{Metrics.} Peak utilization $U = \max_t \big(\sum \text{payload}_t\big) / \text{heap size at end}$; throughput in operations per second over a trace. Internal fragmentation is rounding waste; external is free memory unusable because it is non-contiguous. The CS:APP trace format---\code{a id size}, \code{r id size}, \code{f id}---is what \code{bench/traces/} uses; generate traces mimicking inference workloads (many equal-sized medium blocks with bursts of large ones) in addition to the classic ones.
+
+\textbf{Buddy allocator} (optional variant, used later for the block pool's size classes if you support mixed block sizes): orders $k = 0..K$, block size $2^k m_0$; the buddy of a block at offset $o$ at order $k$ is at $o \oplus 2^k m_0$; splitting and merging are $O(\log)$ and internal fragmentation is up to 50\%.
+
+\subsection{KV-cache geometry}
+
+Per token, per layer, with $h_{kv}$ KV heads of dimension $d_h$ and $b_{kv}$ bytes per element:
+\begin{equation}
+\text{kv}_{\text{layer}} = 2\,h_{kv}\,d_h\,b_{kv},\qquad \text{kv}_{\text{token}} = L\cdot \text{kv}_{\text{layer}}.
+\end{equation}
+Llama-3-8B ($L=32$, $h_{kv}=8$, $d_h=128$, fp16): $4$~KB per layer per token, $128$~KB per token; a 128K-token context is 16~GB. \code{stories15M} is tiny ($L=6$, $d=288$); use it for correctness and a synthetic large config for the memory experiments.
+
+\textbf{Blocks.} A block holds $B$ tokens of one layer's K (or V, or both---choose K and V in separate pools so a kernel's reads are contiguous per tensor): block bytes $= B\,h_{kv}\,d_h\,b_{kv}$; $B=16$ for Llama-3-8B gives 32~KB per K block per layer. Layout inside a block: \code{[B][h\_kv][d\_h]} (token-major) so appending a token writes one contiguous slab and attention for head $j'$ reads with stride $h_{kv}d_h$---or \code{[h\_kv][B][d\_h]} (head-major) so a head's keys are contiguous. Implement token-major first, head-major as a measured alternative.
+
+\textbf{Fragmentation.} A sequence of $n$ tokens wastes at most $B-1$ token slots (internal), versus a contiguous preallocation to $T_{\max}$ that wastes $T_{\max}-n$. With a pool of $N = M/\text{block bytes}$ blocks and $S$ concurrent sequences, the expected waste is $S(B-1)/2$ tokens---the argument for $B$ in the 16--32 range.
+
+\subsection{Sharing: reference counts and copy-on-write}
+
+Each physical block has \code{refcnt}. \code{fork(seq)} copies the block table and increments every block's count: $O(\text{len}/B)$ and no data copied. A write to position $t$ of a sequence whose block has \code{refcnt > 1} first allocates a fresh block, copies the $B$ tokens, decrements the old count, and updates the table---copy-on-write, exactly the kernel's \code{fork} strategy for pages (\ch{9.8.2}). Only the \emph{last} block of a forked sequence is ever written, so at most one copy per fork.
+
+\textbf{Invariants} (tested after every operation in the property test): $\sum_{\text{blocks}}\text{refcnt} = \sum_{\text{seqs}} |\text{table}| + |\text{radix-tree-held blocks}|$; a block is on the free list iff \code{refcnt == 0} and it is not in the tree; no two sequences write the same block.
+
+\subsection{Prefix cache: radix tree over blocks}
+
+Because blocks are the unit of sharing, prefix matching has granularity $B$: node $=$ one full block of $B$ token ids, keyed by those ids, child lookup by the next block's ids (hash of $B$ ints, or a sorted child array). A finished (or in-flight) sequence inserts its \emph{full} blocks; partial last blocks are not cacheable. \code{match(tokens)} walks from the root while the next $B$ tokens equal a child's key, returning the list of physical blocks and the matched length $m = kB$. A new request then reuses those blocks (incrementing \code{refcnt}) and only prefills tokens $m..n$.
+
+\textbf{Eviction.} Candidates are tree leaves with \code{refcnt == 1} (held only by the tree). Policies, each a score function; evict the minimum:
+\begin{itemize}
+  \item LRU: $\text{score} = t_{\text{last access}}$.
+  \item LFU: hit count, with aging.
+  \item Depth-aware LRU: $\text{score} = t_{\text{last}} - \gamma\cdot\text{depth}$, where depth is the node's distance from the root; shallow nodes (shared system prompts) are protected because evicting one orphans every descendant.
+  \item OPT (Belady's MIN): evict the leaf whose next access is furthest in the future. Not implementable online---it needs the future---but computable offline from a recorded trace (below), and it is the yardstick every other policy is measured against.
+\end{itemize}
+Store leaves in an intrusive doubly linked list ordered by score for LRU ($O(1)$), or a binary heap keyed by score for the others ($O(\log n)$); evicting a leaf may expose its parent as a new leaf.
+
+\subsection{Reuse distance and optimal replacement}
+\label{sec:reuse}
+
+Treat the stream of block accesses (every \code{match} hit, every append) as a reference trace $r_1, r_2, \dots, r_n$ over block ids, exactly as the virtual-memory chapter treats page references. Two classical tools then give you the whole hit-rate picture without running a simulation per cache size.
+
+\textbf{Reuse (stack) distance.} For access $r_i$, let $d_i$ be the number of \emph{distinct} blocks referenced since the previous reference to the same block ($d_i = \infty$ for a first reference). Under LRU with capacity $C$ blocks, access $i$ is a hit iff $d_i < C$. Hence a single pass computing the histogram $H(d)$ yields the LRU miss-ratio curve for \emph{every} capacity at once (Mattson's stack algorithm):
+\begin{equation}
+\text{miss}_{\text{LRU}}(C) = \frac{1}{n}\Big(\,n_\infty + \sum_{d \ge C} H(d)\Big).
+\label{eq:mrc}
+\end{equation}
+Computing $d_i$ naively is $O(n^2)$; with a Fenwick (binary indexed) tree over access timestamps it is $O(n\log n)$: keep, for each block, the timestamp of its last access; mark timestamps in the tree; $d_i$ is the count of marked timestamps greater than the block's previous timestamp, after which you unmark the old timestamp and mark the new one. This is the algorithm behind every modern cache-sizing tool, and it is twenty lines.
+
+\textbf{Stack property.} LRU and OPT are \emph{stack algorithms}: the set of blocks resident with capacity $C$ is a subset of the set resident with capacity $C+1$, so misses can only decrease as capacity grows. FIFO is not, which is Belady's anomaly (more memory, more misses); construct the classic trace $1,2,3,4,1,2,5,1,2,3,4,5$ with FIFO at $C=3$ (9 misses) and $C=4$ (10 misses) as a test case, and note that your radix tree's LIFO free-list reuse order can introduce the same effect if you are careless about what ``access'' means.
+
+\textbf{Belady's MIN (OPT).} Offline, with the whole trace known: on a miss with a full cache, evict the resident block whose next reference is furthest in the future (or never). Compute next-use times in one reverse pass over the trace ($\text{next}_i = $ index of the next reference to $r_i$, or $\infty$), then simulate forward with a max-heap keyed by next use. OPT is a lower bound on the misses of any online policy for a given capacity; the ratio $\text{miss}_{\text{LRU}}(C)/\text{miss}_{\text{OPT}}(C)$ is the competitive gap you measure. Two caveats specific to KV blocks: (i) blocks are not independent---a child block is useful only while its ancestors are resident---so the tree-structured OPT evicts leaves first and treats a subtree's next use as the min over its descendants; implement the plain block-level OPT first (a valid lower bound), then the leaf-constrained variant (achievable); (ii) blocks referenced by running sequences are pinned (\code{refcnt > 1}) and excluded from eviction in every policy, so the effective capacity is $C$ minus the pinned set.
+
+\textbf{What the curves tell you.} For a multi-agent workload with shared system prompts, $H(d)$ is bimodal: a spike at small $d$ (the prompts, re-referenced constantly) and a long tail (per-conversation blocks). LRU already captures the spike; the interesting region is where $C$ sits in the tail, and there LRU, LFU and depth-aware LRU separate. Plot \eqref{eq:mrc} together with the simulated LFU, depth-aware and OPT curves against $C$; identify the smallest $C$ at which LRU is within 10\% of OPT---that number, not peak hit rate, is the design output (it is how large the pool must be before policy stops mattering).
+
+\textbf{Working set.} Denning's working set $W(t,\tau)$ is the set of distinct blocks referenced in $(t-\tau, t]$; its size over time, for a few $\tau$, is a one-figure description of the workload and tells you whether a fixed pool can ever hold the hot set. Compute it from the same timestamps in $O(n)$ with a sliding window.
+
+\subsection{Pages and the TLB}
+
+A pool of $M$ bytes with 4~KB pages has $M/4096$ pages; an L1 dTLB of 64 entries covers 256~KB and a 2048-entry STLB covers 8~MB, so random block accesses across a multi-GB pool miss the TLB almost every time and pay a page walk (tens of ns, partially hidden by the page-walk caches). With 2~MB pages the STLB covers 4~GB. Reserve the pool with \code{mmap(NULL, M, PROT\_READ|PROT\_WRITE, MAP\_PRIVATE|MAP\_ANONYMOUS, -1, 0)}, 2~MB-aligned, then \code{madvise(MADV\_HUGEPAGE)} (transparent huge pages; check \code{/sys/kernel/mm/transparent\_hugepage/enabled}) or \code{MAP\_HUGETLB} (preallocated via \code{/proc/sys/vm/nr\_hugepages}). First-touch page faults cost $\sim 0.1$--$0.25\,\mu$s per 4~KB page (zeroing included); \code{MAP\_POPULATE} prefaults. Measure all of it with \code{perf stat} (events \code{dTLB-load-misses}, \code{dTLB-loads}, \code{page-faults}).
+
+\textbf{Cold tier.} A file in \code{/tmp} (or a real NVMe path) accessed with \code{pwrite}/\code{pread} or mapped with \code{mmap(MAP\_SHARED)}; \code{madvise(MADV\_DONTNEED)} and \code{posix\_fadvise(POSIX\_FADV\_DONTNEED)} let you defeat the page cache so you measure the device, not DRAM. The block manager's \code{swap\_out(block)}/\code{swap\_in(block)} move blocks between tiers; eviction from the hot tier may swap instead of drop.
+
+\section{Architecture}
+
+\subsection{Directory layout}
+
+\begin{lstlisting}[style=plain]
+pagedkv/
+  include/pagedkv/
+    malloc.h       pk_malloc/pk_free/pk_realloc/pk_calloc + pk_heap_stats
+    pool.h         fixed-size block pool over mmap: alloc/free block ids, refcounts, huge pages
+    blocktable.h   per-sequence logical->physical mapping, append, fork (COW)
+    radix.h        prefix tree over blocks; match/insert/evict; policies
+    tier.h         cold tier (file-backed); swap in/out; throttle for experiments
+    kvcache.h      facade used by cforward: write_kv(seq, layer, pos, k, v), gather for attention
+    reuse.h        reference-trace recorder; reuse-distance histogram (Fenwick); LRU MRC; OPT simulator; working set
+  src/             malloc.c pool.c blocktable.c radix.c tier.c kvcache.c reuse.c
+  tests/           test_malloc.c test_pool.c test_blocktable.c test_radix.c test_tier.c test_kvcache.c test_props.c
+  bench/           mdriver.c (trace replay, util/throughput), tlb.c (4K vs 2M), tier_bw.c, mrc.c (policies vs OPT)
+  scripts/         gen_traces.py, model_check.py (Python reference model for property tests), plots
+\end{lstlisting}
+
+\subsection{Public API}
+
+\begin{lstlisting}[style=c]
+/* malloc.h */
+int   pk_heap_init(size_t max_bytes);      /* mmap'd arena with emulated sbrk */
+void *pk_malloc(size_t n);  void pk_free(void *p);  void *pk_realloc(void *p, size_t n);
+void *pk_calloc(size_t a, size_t b);
+typedef struct { size_t heap_bytes, payload_bytes, peak_payload, n_free_blocks; } pk_heap_stats;
+pk_heap_stats pk_stats(void);  int pk_check_heap(void);     /* consistency checker, used by tests */
+
+/* pool.h */
+typedef uint32_t pk_block;  #define PK_NOBLOCK UINT32_MAX
+typedef struct { size_t block_bytes; uint32_t n_blocks; bool huge_pages; bool populate; } pk_pool_cfg;
+typedef struct pk_pool pk_pool;
+pk_pool *pk_pool_create(pk_pool_cfg c);   void pk_pool_destroy(pk_pool *);
+pk_block pk_pool_alloc(pk_pool *);        /* refcnt = 1; PK_NOBLOCK if empty */
+void     pk_pool_incref(pk_pool *, pk_block);  void pk_pool_decref(pk_pool *, pk_block); /* frees at 0 */
+uint32_t pk_pool_refcnt(const pk_pool *, pk_block);
+void    *pk_pool_ptr(const pk_pool *, pk_block);    uint32_t pk_pool_free_count(const pk_pool *);
+
+/* blocktable.h */
+typedef struct { pk_block *phys; uint32_t n_blocks, n_tokens, cap; } pk_table;
+int  pk_table_append_token(pk_table *, pk_pool *, uint32_t B);   /* allocs a block when needed */
+int  pk_table_fork(const pk_table *src, pk_table *dst, pk_pool *);
+int  pk_table_make_writable(pk_table *, pk_pool *, uint32_t logical_block, size_t block_bytes); /* COW */
+void pk_table_release(pk_table *, pk_pool *);
+
+/* radix.h */
+typedef enum { PK_EVICT_LRU, PK_EVICT_LFU, PK_EVICT_DEPTH_LRU } pk_policy;   /* OPT lives in reuse.h (offline) */
+typedef struct pk_radix pk_radix;
+pk_radix *pk_radix_create(pk_pool *, uint32_t B, pk_policy);
+uint32_t  pk_radix_match(pk_radix *, const int32_t *tokens, uint32_t n, pk_block *out, uint32_t max); /* returns matched blocks */
+int       pk_radix_insert(pk_radix *, const int32_t *tokens, uint32_t n, const pk_block *phys);
+uint32_t  pk_radix_evict(pk_radix *, uint32_t want_blocks);   /* returns freed count */
+typedef struct { uint64_t lookups, hit_blocks, inserted, evicted; } pk_radix_stats;
+
+/* kvcache.h -- what cforward's attention sees */
+typedef struct pk_kv pk_kv;      /* owns K and V pools (one pair per layer) and all tables */
+pk_kv *pk_kv_create(const cf_config *cfg, size_t pool_bytes, uint32_t B, bool huge_pages);
+typedef struct { const pk_block *blocks; uint32_t n_tokens; uint32_t B; const pk_pool *kpool, *vpool; } pk_kv_view;
+void pk_kv_write(pk_kv *kv, uint32_t seq, int layer, uint32_t pos, const float *k, const float *v);
+pk_kv_view pk_kv_view_for(const pk_kv *kv, uint32_t seq, int layer);
+
+/* reuse.h -- offline analysis of a recorded block-reference trace */
+typedef struct { uint32_t *ref; size_t n; } pk_trace;             /* block ids in access order */
+int    pk_trace_record_begin(pk_radix *, pk_trace *);            /* radix tree appends every access */
+void   pk_reuse_histogram(const pk_trace *, uint64_t *H, size_t maxd, uint64_t *n_inf);  /* O(n log n) */
+void   pk_mrc_lru(const uint64_t *H, size_t maxd, uint64_t n_inf, size_t n, double *miss /* [maxd] */);
+size_t pk_sim_opt(const pk_trace *, size_t C, const uint8_t *pinned);                      /* misses */
+size_t pk_sim_opt_tree(const pk_trace *, size_t C, const uint32_t *parent);               /* leaf-constrained */
+size_t pk_sim_policy(const pk_trace *, size_t C, pk_policy);                              /* same harness */
+void   pk_working_set(const pk_trace *, size_t tau, uint32_t *wss /* [n] */);
+\end{lstlisting}
+
+\subsection{Attention over paged blocks}
+
+\code{cf\_attention} gains a variant \code{cf\_attention\_paged(out, q, view\_k, view\_v, ...)}: for key position $u$, the address is \code{pk\_pool\_ptr(kpool, blocks[u / B]) + (u \% B) * h\_kv * d\_h * sizeof(float)}. Iterate block by block so the inner loop over the $B$ tokens of a block is contiguous and the online-softmax update (project~2) is applied per block. Measure the cost of indirection against the contiguous kernel; it should be within a few percent for $B\ge 16$.
+
+\section{Assignments}
+
+\assignment{A4.1}{The allocator}{14 h}
+\textbf{Goal.} A segregated-fit allocator with measured utilization and throughput against glibc.\\
+\textbf{Steps.} (1) \code{bench/mdriver.c}: trace parser (\code{a}/\code{r}/\code{f}), payload-pattern verification, utilization and throughput reporting, a \code{--glibc} switch. (2) \code{scripts/gen\_traces.py}: the classic trace shapes (coalescing, realloc, binary) and two inference-like traces (steady medium blocks with large bursts; many short-lived small blocks). (3) Implicit free list with immediate coalescing and \code{pk\_check\_heap}; pass correctness on all traces. (4) Explicit free list (LIFO). (5) Segregated classes with the \code{clz} index; measure; tune class boundaries. (6) In-place \code{realloc}; footer elimination for allocated blocks; deferred coalescing as a measured variant. (7) The shadow checker in the test harness.\\
+\textbf{Acceptance.} All traces correct under the shadow checker; $U \ge 0.85$ on the classic traces; throughput within $3\times$ of glibc; \code{pk\_check\_heap} passes after every operation in debug builds; a table in \code{docs/alloc.md} with (variant, trace, $U$, ops/s).\\
+\textbf{Feeds.} Post~4 section 4 (the allocator in two pages) and Fig.~2.
+
+\assignment{A4.2}{Block pool, pages and the TLB}{10 h}
+\textbf{Goal.} An \code{mmap}'d block pool with huge-page support and the TLB experiment.\\
+\textbf{Steps.} (1) \code{pool.c}: reservation, alignment, \code{madvise(MADV\_HUGEPAGE)} / \code{MAP\_HUGETLB}, \code{MAP\_POPULATE}, free-list stack, refcounts with debug underflow checks. (2) \code{bench/tlb.c}: touch one cache line in each of $10^7$ random blocks over pools of 256~MB, 1, 4, 16~GB, with 4~KB and 2~MB pages; ns per access and \code{dTLB-load-misses} via \code{perf stat}; prefetch-defeating access order (dependent, as in pointer chasing). (3) Page-fault cost: time to first-touch a 4~GB pool with and without \code{MAP\_POPULATE}; faults counted. (4) Record THP status and \code{nr\_hugepages} procedure in \code{docs/machine.md}.\\
+\textbf{Acceptance.} Pool tests pass; the TLB figure shows the 4~KB curve rising where the pool exceeds STLB reach and the 2~MB curve flat to several GB; page-fault cost per GB reported; miss counts consistent with the latency jump.\\
+\textbf{Feeds.} Post~4 central figure (Fig.~1) and section 7.
+
+\assignment{A4.3}{Block tables, fork, copy-on-write}{8 h}
+\textbf{Goal.} Sequence-level bookkeeping with sharing semantics proven by a model-based test.\\
+\textbf{Steps.} (1) \code{blocktable.c}: append (allocating on block boundary), fork (refcount increments), \code{make\_writable} (COW), release. (2) \code{kvcache.c}: per-layer K and V pools; \code{pk\_kv\_write}; \code{pk\_kv\_view\_for}. (3) \code{scripts/model\_check.py}: a Python model of the same operations over dictionaries that emits a random operation trace and expected observations; \code{tests/test\_props.c} replays it and checks the three invariants after every step. (4) Benchmark: fork 64 sequences from a 2K-token prefix; measure blocks allocated and bytes copied (expect $\le 1$ block per fork).\\
+\textbf{Acceptance.} COW tests and $10^5$-step property test pass; invariants hold; the fork benchmark reports at most one block copied per fork.\\
+\textbf{Feeds.} Post~4 section 6 (COW with the kernel analogy).
+
+\assignment{A4.4}{Radix tree and online eviction policies}{10 h}
+\textbf{Goal.} Prefix caching with LRU, LFU and depth-aware LRU, and a hit-rate benchmark on agent-style workloads.\\
+\textbf{Steps.} (1) \code{radix.c}: node = block, child lookup by hash of $B$ ids, \code{match}, \code{insert}, refcount interaction with the pool. (2) Eviction: intrusive LRU list; heap-based LFU and depth-aware variants; leaf exposure on eviction. (3) \code{scripts/gen\_workload.py}: $A$ agents with 1--2K-token system prompts, multi-turn conversations with branching, interleaved arrivals; emits token sequences. (4) \code{bench/prefix\_hitrate.c}: replay a workload through the tree with a given pool size and policy; report block hit rate, tokens prefilled, evictions. (5) Random-sequence tests against the brute-force prefix finder; eviction-safety tests.\\
+\textbf{Acceptance.} Radix tests pass; hit-rate benchmark produces a CSV over pool sizes and policies; eviction never touches a block with \code{refcnt > 1} (asserted in debug).\\
+\textbf{Feeds.} Post~4 section 5 (eviction scores) and the simulated policy curves of Fig.~3.
+
+\assignment{A4.5}{Reuse distance, OPT, working set}{12 h}
+\textbf{Goal.} The offline analysis of Section~\ref{sec:reuse} and the policies-vs-OPT figure.\\
+\textbf{Steps.} (1) \code{reuse.c}: trace recorder hooked into the radix tree (every access appends a block id). (2) Brute-force $O(n^2)$ reuse distance (test oracle), then the Fenwick-tree version; the histogram and Equation~\eqref{eq:mrc}. (3) LRU simulator for cross-checking the histogram-derived curve at every $C$. (4) FIFO simulator and the Belady-anomaly test trace. (5) OPT: reverse pass for next-use, forward simulation with a max-heap; then the leaf-constrained variant using the parent array from the radix tree. (6) Working-set size over time with a sliding window. (7) \code{bench/mrc.c}: on the A4.4 workloads, miss ratio vs $C$ for LRU (both ways), LFU, depth-aware, OPT, tree-OPT; \code{scripts/plot\_mrc.py}; the ``smallest $C$ within 10\% of OPT'' number.\\
+\textbf{Acceptance.} All reuse-analysis tests in the test plan pass; histogram-derived and simulated LRU curves agree exactly; OPT $\le$ every policy at every $C$ and monotone; the MRC figure and the 10\%-of-OPT capacity are in the README.\\
+\textbf{Feeds.} Post~4 Fig.~3--4 and section 8; all of Post~4b.
+
+\assignment{A4.6}{Cold tier and paged attention}{10 h}
+\textbf{Goal.} A second storage tier and \code{cforward} reading K/V through block tables.\\
+\textbf{Steps.} (1) \code{tier.c}: file-backed store, \code{swap\_out}/\code{swap\_in}, page-cache defeat, throttle option; \code{bench/tier\_bw.c} vs \code{dd}. (2) Eviction-to-tier instead of drop, with a hit from the tier counted separately. (3) \code{cf\_attention\_paged} in \code{cforward} (branch there; submodule or copy here) iterating block by block with the online-softmax update per block; bit-identity test. (4) Benchmark paged vs contiguous attention vs $B\in\{8,16,32,64\}$. (5) End to end: 64 forked sequences sharing a 2K prefix, decoding 128 tokens each, through the paged path.\\
+\textbf{Acceptance.} Tier tests pass with throughput within 20\% of \code{dd}; paged attention bit-identical to contiguous; overhead $\le 5\%$ at $B \ge 16$; the end-to-end run reports total blocks and bytes and matches the fork arithmetic.\\
+\textbf{Feeds.} Post~4 Fig.~5 and results; Post~6's engine.
+
+\section{Test plan}
+
+\begin{description}
+  \item[Allocator correctness] Trace replay with a payload pattern (fill each block with its id; verify before free); alignment of every returned pointer; \code{pk\_check\_heap} after every op in debug builds (free list consistency, no adjacent free blocks after coalescing, header/footer agreement, every free block in exactly one list). A \emph{shadow checker} in the test harness---a byte bitmap marking allocated ranges---catches overlap, since ASan cannot see inside your allocator.
+  \item[Coalescing] Four hand-built cases; realloc in place (pointer unchanged) when the next block is free; realloc preserves contents.
+  \item[Utilization/throughput] Assert $U\ge 0.85$ on the classic traces and throughput within $3\times$ of glibc (soft).
+  \item[Pool] Alloc until \code{PK\_NOBLOCK}; free all; alloc again returns every id exactly once; refcounts never underflow (abort in debug).
+  \item[COW semantics] Fork, write to child's last block, parent's data unchanged, child's block table differs in exactly one entry, old block's refcount decremented.
+  \item[Radix] Random token sequences with shared prefixes: \code{match} agrees with a brute-force longest-common-prefix over all inserted sequences (rounded down to $B$); insert is idempotent; eviction never frees a block with refcount $>1$; after evicting everything the pool is full again.
+  \item[Property/model-based test] 10$^5$ random operations (append, fork, finish+insert, match+reuse, evict) against a Python dictionary model exported as a trace; the three invariants from the sharing section hold after every step.
+  \item[Reuse analysis] Reuse distances on hand-made traces match a brute-force $O(n^2)$ computation; the LRU miss count from \eqref{eq:mrc} equals the simulated LRU miss count for every $C$ on $10^3$ random traces; FIFO on the Belady-anomaly trace gives 9 misses at $C=3$ and 10 at $C=4$; OPT misses $\le$ every other policy's misses for every $C$; OPT is monotone in $C$; the leaf-constrained OPT never evicts a node with a resident child.
+  \item[Tier] Swap out, corrupt the hot copy, swap in, compare; throughput of the tier within 20\% of \code{dd}-measured device bandwidth.
+  \item[Paged attention] Bit-identical to contiguous attention for the same K/V (same operation order within blocks---design the kernel so this is true, and the test enforces it).
+  \item[Sanitizers] ASan on everything except the allocator's own arena (use a \code{PK\_ASAN\_POISON} hook with \code{\_\_asan\_poison\_memory\_region} for free blocks---optional, instructive).
+\end{description}
+
+\section{Measurements and blog briefs}
+
+(i) Utilization and throughput vs glibc per trace; (ii) random-access latency over the pool for 4~KB vs 2~MB pages, with dTLB miss counts; (iii) page-fault cost per GB; (iv) miss ratio vs pool size $C$ for LRU (from the histogram and from simulation---they must agree), LFU, depth-aware LRU, OPT and tree-OPT on synthetic agent workloads; (v) reuse-distance histogram and working-set size over time; (vi) paged vs contiguous attention throughput vs $B$.
+
+\begin{blogbox}
+\post{4} \textbf{``Paging a KV cache on a CPU: what the TLB thinks of PagedAttention''}
+
+\textbf{Audience and thesis.} For people who know vLLM's block tables from the paper and have not thought about the hardware page tables underneath them. Thesis: the KV cache is a virtual-memory problem twice over---blocks are pages at the application level, and the pool is pages at the hardware level---and the same arithmetic (reach, fragmentation, replacement) governs both. Subtitle: ``random block access costs $X$~ns with 4~KB pages and $Y$~ns with 2~MB pages once the pool passes $Z$~MB''.
+
+\textbf{Length.} 3000--3500 words.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} (central) Access latency (ns, $y$) vs pool size (log $x$, 256~MB to 16~GB) for 4~KB and 2~MB pages, with L1 dTLB and STLB reach marked as vertical lines; dTLB miss rate as a secondary panel.
+  \item \fig{2} Allocator utilization and throughput, your variants vs glibc, per trace (grouped bars).
+  \item \fig{3} Miss ratio vs pool size $C$ (blocks, log $x$) for LRU, LFU, depth-aware LRU, OPT, tree-OPT on the multi-agent workload; the ``within 10\% of OPT'' capacity marked.
+  \item \fig{4} Reuse-distance histogram (log--log) for the same workload, bimodal, with the system-prompt spike annotated; inset: working-set size over time for two $\tau$.
+  \item \fig{5} Paged vs contiguous attention throughput vs block size $B$.
+  \item \fig{6} Block-geometry diagram: logical sequence $\to$ block table $\to$ physical blocks, with a forked sequence sharing all but the last block (refcounts shown).
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: the two-level claim and the headline latency numbers.
+  \item Fig.~1 and the TLB-reach arithmetic that predicts where the curves bend (worked: 2048 entries $\times$ 4~KB $= 8$~MB; $\times$ 2~MB $= 4$~GB).
+  \item Setup.
+  \item The allocator in two pages: boundary tags, segregated lists, the $\lceil (r+8)/16\rceil\cdot 16$ rounding, Fig.~2, and what utilization means. Code excerpt: coalescing case 4.
+  \item Block geometry: kv per token, block bytes, the $S(B-1)/2$ expected waste, Fig.~6.
+  \item Sharing: refcounts and copy-on-write, the \code{fork(2)} analogy, the three invariants, and how the model-based test enforces them.
+  \item Eviction scores: LRU, LFU, depth-aware; why shallow nodes deserve protection.
+  \item Reuse distance in twenty lines, Equation~\eqref{eq:mrc}, and Fig.~3--4: the capacity at which policy stops mattering is the design output.
+  \item The TLB experiment in detail: huge pages, \code{MAP\_POPULATE}, page-fault cost; Fig.~1 again with the miss counts.
+  \item Paged attention: the indirection cost, Fig.~5, and why $B=16$ is where everyone lands.
+  \item What went wrong: THP silently disabled (\code{madvise} vs \code{always}); the first latency benchmark measured the prefetcher, not the TLB; refcount underflow on double release caught by the debug assert.
+  \item What this predicts: GPU TLBs and why vLLM's 16-token blocks and 2~MB CUDA allocations interact; what a memory bank with a few hundred slots (your memory-slot experiments) looks like through the same lens---a reuse-distance histogram is the first thing to compute.
+  \item Reproduce box (needs root for \code{nr\_hugepages}; say so).
+\end{enumerate}
+
+\textbf{Code to show.} Coalescing case; the COW path; the Fenwick reuse-distance core; the \code{mmap}+\code{madvise} setup.
+
+\post{4b} \textbf{``Belady's MIN for KV blocks: how far is LRU from optimal?''}
+
+\textbf{Thesis.} Every KV-eviction heuristic should be reported against the offline optimum, and the optimum is cheap to compute from a trace. \textbf{Length} 1400--1800 words. \textbf{Figures:} Fig.~3 from the main post, reproduced alone; a small diagram of the reverse next-use pass; a bar chart of LRU/OPT miss ratio at three capacities for three workload shapes (single agent, 8 agents, 64 agents). \textbf{Outline:} the reference-trace view of a KV cache; stack distance and the one-pass miss-ratio curve (the Fenwick trick, with code); the stack property and Belady's anomaly (the 12-reference trace worked by hand, FIFO at $C=3$ and $4$); OPT and its proof sketch of optimality (exchange argument, three sentences); the tree constraint and why the plain OPT is still a valid lower bound; the gap on the three workloads; what an online policy could exploit (depth, agent id) and how much is left; reproduce box. \textbf{What went wrong:} counting an append as an access of the new block (which is always a miss) inflated every curve equally and hid the policy differences---define the trace precisely.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} pull requests against yourself; branch protection; conventional commits; \code{revert} vs \code{reset} on public history; \code{cherry-pick}; \code{rebase --onto}; GitHub Releases.
+
+\textbf{Practice.}
+\begin{enumerate}
+  \item Protect \code{main} on GitHub (require PR, require status checks once CI exists in project~6). From now on nothing lands on \code{main} except through a PR.
+  \item For each assignment: branch, commits, \code{gh pr create --fill}, then review your own diff on GitHub as if it were someone else's---leave comments, fix them in new commits, then \code{gh pr merge --squash} (or \code{--rebase} if the commits are already clean). Squash merging is why the branch's commit hygiene can be looser than in project~2.
+  \item Adopt conventional commits: \code{feat(reuse): add leaf-constrained OPT}, \code{fix(pool): refcount underflow on double decref}, \code{perf(attn): block-major K layout}, \code{test}, \code{docs}, \code{chore}. These feed the CHANGELOG in project~6.
+  \item Undo on public history with \code{git revert <sha>} (a new commit), never \code{reset}; keep \code{reset} for local branches.
+  \item \code{git cherry-pick <sha>} to carry a fix from a feature branch to \code{main} (then rebase the branch to drop the duplicate); \code{git rebase --onto main A B} to transplant a sub-range of commits.
+  \item \code{gh release create v0.4.0 --generate-notes} after A4.6.
+\end{enumerate}
+\end{gitbox}

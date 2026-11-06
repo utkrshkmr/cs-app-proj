@@ -1,0 +1,111 @@
+% ------------------------------------------------------------------
+%  Six Systems Projects for CS:APP
+%  Build: latexmk -pdf main.tex      (or: pdflatex main && pdflatex main)
+% ------------------------------------------------------------------
+\documentclass[11pt,letterpaper,oneside]{report}
+
+\usepackage[margin=1in]{geometry}
+% T1 fontenc omitted: cm-super not installed here; add it back if available
+\usepackage[utf8]{inputenc}
+
+\usepackage[expansion=false]{microtype}
+\usepackage{parskip}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+
+\emergencystretch=2.5em
+\tolerance=2000
+\setlist{nosep,leftmargin=*}
+\setlist[description]{style=nextline,font=\normalfont\bfseries}
+
+% ---------- listings ----------
+\definecolor{codebg}{RGB}{247,247,247}
+\definecolor{codekw}{RGB}{0,70,140}
+\definecolor{codecm}{RGB}{100,110,100}
+\definecolor{codestr}{RGB}{150,50,20}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\color{codestr},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0.3pt, rulecolor=\color{black!30},
+  xleftmargin=6pt, xrightmargin=6pt, framexleftmargin=6pt,
+  breaklines=true, breakatwhitespace=false,
+  columns=fullflexible, keepspaces=true,
+  showstringspaces=false, tabsize=4,
+  numbers=none, captionpos=b, aboveskip=6pt, belowskip=6pt,
+}
+\lstdefinelanguage{bashx}{
+  morekeywords={git,make,gcc,clang,perf,python3,objdump,readelf,nm,gh,cd,ls,ssh-keygen,export,valgrind},
+  sensitive=true, morecomment=[l]{\#}, morestring=[b]", morestring=[b]',
+}
+\lstdefinestyle{c}{language=C}
+\lstdefinestyle{cpp}{language=C++}
+\lstdefinestyle{sh}{language=bashx}
+\lstdefinestyle{plain}{language={}}
+
+% ---------- callout boxes ----------
+\newtcolorbox{hook}{enhanced,breakable,colback=blue!4,colframe=blue!50!black,
+  title=Research hook,fonttitle=\bfseries,left=4pt,right=4pt,top=3pt,bottom=3pt}
+\newtcolorbox{gitbox}{enhanced,breakable,colback=orange!6,colframe=orange!75!black,
+  title=Git lesson for this project,fonttitle=\bfseries,left=4pt,right=4pt,top=3pt,bottom=3pt}
+\newtcolorbox{blogbox}{enhanced,breakable,colback=green!5,colframe=green!35!black,
+  title=Blog plan,fonttitle=\bfseries,left=4pt,right=4pt,top=3pt,bottom=3pt}
+\newtcolorbox{pitfall}{enhanced,breakable,colback=red!4,colframe=red!55!black,
+  title=Pitfall,fonttitle=\bfseries,left=4pt,right=4pt,top=3pt,bottom=3pt}
+\newtcolorbox{leftto}{enhanced,breakable,colback=black!3,colframe=black!55,
+  title=Left to you,fonttitle=\bfseries,left=4pt,right=4pt,top=3pt,bottom=3pt}
+
+% ---------- assignment / blog macros ----------
+\newcommand{\assignment}[3]{\subsubsection*{#1\quad #2\hfill{\normalfont\small\itshape #3}}}
+\newcommand{\fig}[1]{\textbf{Figure #1.}}
+\newcommand{\post}[1]{\textbf{Post #1.}}
+
+% ---------- shorthands ----------
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\csapp}{CS:APP}
+\newcommand{\ch}[1]{\textsection\,#1}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\rmsnorm}{RMSNorm}
+\DeclareMathOperator{\silu}{SiLU}
+\DeclareMathOperator{\clamp}{clamp}
+\DeclareMathOperator{\round}{round}
+\DeclareMathOperator{\ulp}{ulp}
+\DeclareMathOperator{\AI}{AI}
+
+\title{\Huge Six Systems Projects for \csapp\\[0.6em]
+  \Large A C/C++ build-as-you-read companion to\\
+  \emph{Computer Systems: A Programmer's Perspective}\\[0.4em]
+  \large aimed at LLM inference, KV-cache, and accelerator work}
+\author{Prepared for Utkarsh Kumar (UK)}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+\input{00-frontmatter}
+\input{01-infrastructure}
+\input{02-p1-qnum}
+\input{03-p2-cforward}
+\input{04-p3-ltrace}
+\input{05-p4-pagedkv}
+\input{06-p5-tinyjit}
+\input{07-p6-servlet}
+\appendix
+\input{08-appendix}
+
+\end{document}

@@ -1,0 +1,302 @@
+\chapter{Project 2: \code{cforward} --- an optimized single-core transformer forward pass}
+\label{ch:p2}
+
+\section{Goal}
+
+A plain-C decoder-only transformer forward pass (Llama architecture: RMSNorm, RoPE, grouped-query attention, SwiGLU) that loads real weights, matches the reference implementation's logits, and is then optimized step by step---loop order, cache blocking, SIMD intrinsics, multiple accumulators, quantized weights from project~1---with every step placed on a roofline you measured yourself. The project starts with \csapp's \emph{memory mountain} so that the roofline's two ceilings are numbers from your machine, not from a datasheet.
+
+\begin{hook}
+Prefill is compute-bound and decode is bandwidth-bound; every serving paper you read or write assumes this. Here you derive it, measure it on a CPU, and see what quantized weights do to the decode ceiling---the same analysis you will do for GPUs, Tenstorrent cores, and bandwidth-rich but FLOPs-poor accelerators.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{5.1}--5.6 optimization blockers, CPE & measuring each kernel in cycles per element \\
+\ch{5.7} modern processor operation, latency vs throughput & the multiple-accumulator argument \\
+\ch{5.8}--5.11 loop unrolling, reassociation, SIMD & the matvec/GEMM ladder \\
+\ch{5.12}--5.14 memory performance, limiting factors & why decode saturates DRAM, not the FMA units \\
+\ch{6.2}--6.4 memory hierarchy, caches & blocking and the miss-rate analysis \\
+\ch{6.5}--6.7 writing cache-friendly code, the memory mountain & assignment A2.0 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Mathematical background}
+
+\subsection{The model}
+
+Notation: model dimension $d$, layers $L$, query heads $h$, key/value heads $h_{kv}$ (GQA; $h_{kv} = h$ is multi-head attention), head dimension $d_h = d/h$, MLP hidden size $F$, vocabulary $V$, sequence position $t$ (0-based), RoPE base $\theta_0$ (10000 for Llama~2, 500000 for Llama~3).
+
+Per layer $\ell$ the parameters are $W_q\in\R^{hd_h\times d}$, $W_k, W_v\in\R^{h_{kv}d_h\times d}$, $W_o\in\R^{d\times hd_h}$, $W_1,W_3\in\R^{F\times d}$, $W_2\in\R^{d\times F}$ and two RMSNorm gains $g^{\text{attn}}, g^{\text{ffn}}\in\R^d$. Globally: embedding $E\in\R^{V\times d}$, final norm $g^{\text{out}}$, output projection $W_{\text{out}}\in\R^{V\times d}$ (often tied to $E$).
+
+\textbf{RMSNorm.}
+\begin{equation}
+\rmsnorm(x; g)_i = g_i \,\frac{x_i}{\sqrt{\tfrac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon}},\qquad \epsilon = 10^{-5}\text{ or }10^{-6}\text{ (from the config)}.
+\end{equation}
+
+\textbf{Rotary position embedding.} For each head, pair up dimensions $(2i, 2i+1)$, $i=0,\dots,d_h/2-1$, with frequency $\omega_i = \theta_0^{-2i/d_h}$. At position $t$ the pair is rotated by angle $t\omega_i$:
+\begin{equation}
+\begin{pmatrix} q'_{2i}\\ q'_{2i+1}\end{pmatrix} =
+\begin{pmatrix} \cos t\omega_i & -\sin t\omega_i\\ \sin t\omega_i & \cos t\omega_i\end{pmatrix}
+\begin{pmatrix} q_{2i}\\ q_{2i+1}\end{pmatrix}.
+\end{equation}
+Applied to $q$ and $k$ (not $v$), this makes $q_t\cdot k_u$ depend only on $t-u$. Precompute $\cos t\omega_i$, $\sin t\omega_i$ for all $t<T_{\max}$ once (an $T_{\max}\times d_h/2$ table each). Two pairing conventions exist---adjacent pairs $(2i,2i+1)$ as above (\code{llama2.c}, GGML) and half-split pairs $(i, i+d_h/2)$ (Hugging Face)---and weights exported from one convention must be permuted for the other; this is the single most common source of ``logits almost match''.
+
+\textbf{Attention (one new token at position $t$, head $j$, kv head $j' = \lfloor j / (h/h_{kv})\rfloor$).}
+\begin{equation}
+s_u = \frac{q_j\cdot K^{(j')}_u}{\sqrt{d_h}}\ \ (u=0..t),\qquad a = \softmax(s),\qquad o_j = \sum_{u=0}^{t} a_u V^{(j')}_u .
+\end{equation}
+During prefill the same is done for all positions at once with the causal mask $s_{tu} = -\infty$ for $u>t$.
+
+\textbf{Numerically stable softmax.} With $m = \max_u s_u$: $a_u = e^{s_u - m}/\sum_v e^{s_v-m}$. Subtracting $m$ changes nothing mathematically and prevents overflow of $e^{s}$ in fp32 for $s > 88.7$.
+
+\textbf{Online softmax} (one pass, no stored scores; the core of FlashAttention and of the blocked attention kernel in A2.4). Maintain $(m, l, o)$ initialized to $(-\infty, 0, \mathbf{0})$; for each new $(s_u, V_u)$:
+\begin{equation}
+m' = \max(m, s_u),\qquad l' = l\,e^{m-m'} + e^{s_u - m'},\qquad o' = o\,e^{m-m'} + e^{s_u-m'}\,V_u,
+\end{equation}
+and output $o/l$ at the end. Processing a block of $B$ keys at a time uses the same update with the block's local max and partial sums. Prove to yourself (and test) that it equals the two-pass version exactly in real arithmetic and to within a few ULPs in fp32.
+
+\textbf{MLP (SwiGLU).}
+\begin{equation}
+y = W_2\big(\silu(W_1 \tilde{x}) \odot W_3 \tilde{x}\big),\qquad \silu(z) = \frac{z}{1+e^{-z}}.
+\end{equation}
+
+\textbf{One layer.} $\tilde{x} = \rmsnorm(x; g^{\text{attn}})$; $x \leftarrow x + W_o\,\mathrm{Attn}(\tilde{x})$; $\tilde{x} = \rmsnorm(x; g^{\text{ffn}})$; $x \leftarrow x + \mathrm{MLP}(\tilde{x})$. After $L$ layers: $\text{logits} = W_{\text{out}}\rmsnorm(x; g^{\text{out}})$.
+
+\textbf{Sampling.} Greedy: $\arg\max$. Temperature $\tau$: $\softmax(\text{logits}/\tau)$. Top-$p$: sort descending, keep the smallest prefix with cumulative probability $\ge p$, renormalize, sample. Greedy decoding is what the tests use (deterministic).
+
+\subsection{Cost model}
+
+Parameter count (ignoring norms): $P \approx L\big[d\cdot hd_h + 2\,d\cdot h_{kv}d_h + hd_h\cdot d + 3dF\big] + 2Vd$. One decode step performs, per layer, a matrix-vector product with each weight matrix ($2$ FLOPs per weight) plus attention over $t$ cached positions ($\approx 4 t\, h d_h$ FLOPs):
+\begin{equation}
+\text{FLOPs}_{\text{decode}}(t) \approx 2P + 4Lthd_h,\qquad
+\text{Bytes}_{\text{decode}}(t) \approx P\,b_w + 2L\,t\,h_{kv}d_h\,b_{kv},
+\end{equation}
+with $b_w$, $b_{kv}$ bytes per weight and per KV element. Prefill of $T$ tokens: $\text{FLOPs} \approx 2PT + 2LT^2hd_h$, bytes $\approx P b_w + \text{KV}(T)$.
+
+\textbf{Arithmetic intensity} is FLOPs per byte moved from DRAM. For a matrix--vector product $y = Wx$ with $W\in\R^{m\times n}$: $2mn$ FLOPs over $mn\,b_w$ bytes $\Rightarrow \AI = 2/b_w$ FLOP/byte: $0.5$ for fp32, $1$ for bf16, $2$ for int8, $4$ for int4. For prefill with $T$ tokens the weights are reused $T$ times: $\AI \approx 2T/b_w$.
+
+\textbf{Roofline.} With measured peak compute $F_{\text{peak}}$ (FLOP/s) and DRAM bandwidth $\beta$ (B/s), attainable performance is
+\begin{equation}
+F_{\text{att}}(\AI) = \min\big(F_{\text{peak}},\ \beta\cdot\AI\big),\qquad \text{ridge point } \AI^\ast = F_{\text{peak}}/\beta .
+\end{equation}
+A CPU with $F_{\text{peak}} = 1$~TFLOP/s and $\beta = 50$~GB/s has $\AI^\ast = 20$; decode at $\AI\le 4$ is therefore bandwidth-bound by a factor of five or more even with int4 weights, and the token rate is bounded by
+\begin{equation}
+\text{tokens/s} \le \frac{\beta}{P\,b_w + \text{KV}(t)} .
+\end{equation}
+Prefill crosses the ridge when $T > \AI^\ast b_w/2$---about 40 tokens for fp32 on that machine. Plot the ridge, then plot every kernel version as a point.
+
+\textbf{Peak compute.} $F_{\text{peak}} = \text{cores}\times f_{\text{clock}}\times \text{FMA units}\times 2\times \text{lanes}$, with 8 fp32 lanes for AVX2 and 16 for AVX-512; a typical desktop core with two 256-bit FMA units at 4~GHz gives $128$~GFLOP/s per core. Measure it instead (A2.0): the sustained all-core AVX frequency is lower than the sticker.
+
+\subsection{Why one accumulator is slow (\ch{5.7})}
+
+A reduction $\mathit{acc} \mathrel{+}= a_i b_i$ forms a dependency chain through $\mathit{acc}$: each FMA must wait for the previous one's result, so throughput is one FMA per latency $\lambda$ (4 cycles on recent Intel and AMD cores), giving CPE $=\lambda/\text{lanes}$ no matter how many FMA units exist. With $k$ independent accumulators the chains interleave:
+\begin{equation}
+\text{CPE} = \max\!\left(\frac{\lambda}{k\cdot\text{lanes}},\ \frac{1}{\text{FMA units}\cdot\text{lanes}}\right),
+\end{equation}
+so saturating two FMA units with latency 4 needs $k\ge 8$ accumulators (64 partial sums in fp32 AVX2). Reassociating a floating-point sum this way changes the result in the last bits; the compiler is not allowed to do it without \code{-ffast-math}, which is why you do it by hand---and why bit-identical results across builds are not to be expected. Keep an \code{-O2}-without-fast-math reference build for the tests.
+
+\subsection{Cache blocking for GEMM (\ch{6.6})}
+
+For $C \mathrel{+}= AB$ with $n\times n$ fp32 matrices, line size 64 bytes ($w=16$ floats), the $ijk$ loop reads a column of $B$ with stride $n$---one miss per element---so misses $\approx n^3 + n^3/w$. The $ikj$ order makes the inner loop contiguous in both $B$ and $C$: misses $\approx 2n^3/w$. Blocking with $b\times b$ tiles keeps three tiles resident: $3b^2\cdot 4 \le C_{L1} \Rightarrow b \le \sqrt{C_{L1}/12}$, about $52$ for a 32~KB L1d, so $b\in\{32, 48\}$. Each $(n/b)^3$ tile multiplication then costs $\approx 2b^2/w$ misses, total $\approx \tfrac{2n^3}{w\,b}$: blocking buys a factor of $b$ over $ikj$. Add a second level of blocking for L2 ($b_2 \approx \sqrt{C_{L2}/12}$) and you have the structure of every BLAS. For decode you only need matrix--\emph{vector} products, where blocking cannot help (every weight is touched once) and the only levers are bytes per weight and bandwidth utilization; that contrast is the lesson.
+
+\subsection{The memory mountain (\ch{6.6.1})}
+
+Read throughput as a function of working-set size $S$ and stride $\sigma$ (in 8-byte words): for each $(S,\sigma)$ sum an array of $S$ bytes with the given stride, enough repetitions to take $\ge 100$~ms, report bytes/s. The surface exposes L1, L2, L3 and DRAM plateaus along the size axis and the hardware prefetcher's reach along the stride axis. Add a pointer-chasing latency test (a random cyclic permutation; dependent loads) to get cycles per access at each level. These numbers go into \code{docs/machine.md} and the roofline.
+
+\section{Architecture}
+
+\subsection{Directory layout}
+
+\begin{lstlisting}[style=plain]
+cforward/
+  include/cforward/
+    model.h       config, weights (memory-mapped), tokenizer handle
+    kernels.h     rmsnorm, rope, matvec/gemm (several variants), attention, silu-gate, softmax
+    forward.h     cf_forward_token / cf_forward_prefill / sampling
+    tokenizer.h   llama2.c-style sentencepiece BPE (encode/decode)
+    roofline.h    cycle counters (rdtsc / clock_gettime), perf-event wrappers
+  src/            one .c per header; kernels/ subdir with matvec_naive.c matvec_blocked.c matvec_avx2.c ...
+  tests/          test_rmsnorm.c test_rope.c test_softmax.c test_matvec.c test_attention.c test_forward.c
+  bench/          mountain.c peak_flops.c peak_bw.c bench_matvec.c bench_decode.c
+  scripts/        export_safetensors.py (HF -> safetensors + config.json), golden_logits.py, plot_roofline.py, plot_mountain.py
+  data/           (ignored) stories15M.safetensors tokenizer.bin golden/*.bin
+\end{lstlisting}
+
+\subsection{Public API}
+
+\begin{lstlisting}[style=c]
+/* model.h */
+typedef struct {
+  int dim, n_layers, n_heads, n_kv_heads, hidden_dim, vocab_size, max_seq_len;
+  float norm_eps, rope_theta;
+  enum { CF_W_F32, CF_W_BF16, CF_W_INT8, CF_W_INT4 } wtype;    /* via qnum */
+  int group;                                                     /* int quant group */
+} cf_config;
+
+typedef struct cf_model cf_model;              /* opaque: mmap'd weights + per-layer pointers */
+int  cf_model_open(const char *safetensors_path, const char *config_json, cf_model **out);
+void cf_model_close(cf_model *m);
+const cf_config *cf_model_config(const cf_model *m);
+
+/* kernels.h -- every kernel has a reference and >=1 optimized variant with identical signature */
+typedef void (*cf_matvec_fn)(float *y, const void *W, const float *x, int m, int n, int wtype, int group);
+extern const struct { const char *name; cf_matvec_fn fn; } cf_matvec_variants[];
+void cf_rmsnorm(float *y, const float *x, const float *g, int d, float eps);
+void cf_rope(float *q, float *k, int pos, int n_heads, int n_kv_heads, int head_dim,
+             const float *cos_tab, const float *sin_tab);
+void cf_softmax(float *x, int n);
+void cf_attention(float *out, const float *q, const float *K, const float *V,
+                  int pos, int n_heads, int n_kv_heads, int head_dim, int kv_stride);
+void cf_silu_gate(float *h1, const float *h3, int n);          /* h1 = silu(h1) * h3 */
+
+/* forward.h */
+typedef struct cf_state cf_state;              /* activations + KV cache [L][T][h_kv*d_h] (contiguous in P2) */
+cf_state *cf_state_new(const cf_model *m);
+void      cf_state_free(cf_state *s);
+float    *cf_forward(cf_model *m, cf_state *s, int token, int pos);     /* returns logits[V] */
+void      cf_prefill(cf_model *m, cf_state *s, const int *tokens, int n, float *last_logits);
+int       cf_sample_greedy(const float *logits, int V);
+int       cf_sample_topp(const float *logits, int V, float temp, float top_p, uint64_t *rng);
+
+/* roofline.h */
+uint64_t cf_cycles(void);                       /* rdtsc; calibrate against clock_gettime */
+typedef struct { long long cycles, instructions, l1d_miss, llc_miss, dtlb_miss; } cf_counters;
+int  cf_perf_open(cf_counters *c);  void cf_perf_read(cf_counters *c);   /* perf_event_open */
+\end{lstlisting}
+
+\subsection{Weight layout}
+
+Store every matrix row-major as $W[m][n]$ so that $y_i = \sum_j W_{ij} x_j$ reads row $i$ contiguously (one dot product per output; this is what SIMD and the multiple-accumulator trick want). Quantized weights (project~1) are stored row-major in groups along $n$ so that a row's scales are contiguous too. Memory-map the safetensors file read-only with \code{MAP\_PRIVATE}: no copy, instant startup, and the OS page cache does the rest (chapter~9 preview; project~4 makes it explicit).
+
+\subsection{The optimization ladder for \code{matvec}}
+
+Each rung is a separate source file and a separate entry in \code{cf\_matvec\_variants}, so that they can be benchmarked and tested against each other:
+\begin{enumerate}[label=R\arabic*.]
+  \item \code{naive}: the textbook double loop, \code{-O2}. Record CPE.
+  \item \code{unroll4}: inner loop unrolled 4$\times$ with one accumulator; shows the dependency-chain limit.
+  \item \code{acc8}: $8$ scalar accumulators; CPE should drop by nearly $\lambda$.
+  \item \code{avx2}: \code{\_mm256\_fmadd\_ps} with 1 vector accumulator; then \code{avx2\_acc4}/\code{acc8}.
+  \item \code{avx2\_bf16}: load bf16 weights, widen with a shift (\code{\_mm256\_slli\_epi32} after \code{\_mm256\_cvtepu16\_epi32}), FMA. Halves bytes, roughly doubles tokens/s if bandwidth-bound.
+  \item \code{avx2\_int8}, \code{avx2\_int4}: dequantize on the fly ( \code{cvtepi8\_epi32} $\to$ \code{cvtepi32\_ps} $\to$ multiply by group scale), or better, accumulate integer dot products per group with \code{\_mm256\_madd\_epi16} and apply the scale once per group.
+  \item \code{omp}: rows split across threads with OpenMP; confirms you hit $\beta$ with all cores.
+\end{enumerate}
+For prefill, \code{gemm} variants: \code{ijk}, \code{ikj}, \code{blocked}, \code{blocked\_avx2} (micro-kernel computing a $6\times 16$ tile of $C$ in registers: 12 ymm accumulators, broadcast $A$, load $B$).
+
+\section{Assignments}
+
+\assignment{A2.0}{Memory mountain, peak FLOP/s, peak bandwidth, roofline}{8 h}
+\textbf{Goal.} Your machine's two ceilings and its cache plateaus, measured, in \code{docs/machine.md}.\\
+\textbf{Steps.} (1) \code{roofline.h}: \code{rdtsc} calibrated against \code{clock\_gettime}; a \code{perf\_event\_open} wrapper for cycles and instructions. (2) \code{bench/mountain.c}: sizes $16$~KB to $256$~MB (powers of two with midpoints), strides $1$--$32$ words, reading with 4 independent accumulators (so the measurement is not latency-bound), repetitions scaled to $\ge 100$~ms; CSV output. (3) \code{bench/latency.c}: pointer chasing over a random cyclic permutation; cycles per dependent load vs size. (4) \code{bench/peak\_flops.c}: a loop of \code{\_mm256\_fmadd\_ps} with 8, 12, 16 independent accumulators, single core and all cores (OpenMP); report GFLOP/s and the implied sustained frequency. (5) \code{bench/peak\_bw.c}: read, write, and copy bandwidth for a 1~GB buffer, single core and all cores. (6) \code{scripts/plot\_mountain.py} and \code{plot\_roofline.py} (empty roofline: ceilings and ridge point only).\\
+\textbf{Acceptance.} Mountain plot shows distinguishable L1/L2/L3/DRAM plateaus whose sizes agree with \code{lscpu} within a factor of two; latency plot shows the same transitions; measured peak FLOP/s is within 30\% of the datasheet formula; \code{machine.md} lists all numbers with the commands that produced them.\\
+\textbf{Feeds.} Post~2 Fig.~1 (mountain) and the ceilings of Fig.~2.
+
+\assignment{A2.1}{Reference forward pass}{14 h}
+\textbf{Goal.} A naive fp32 forward pass whose logits match the Python reference.\\
+\textbf{Steps.} (1) \code{scripts/export\_safetensors.py}: \code{stories15M} and \code{stories110M} to safetensors plus \code{config.json}, with the RoPE pairing convention stated in the config. (2) \code{model.h}: \code{mmap} the file, parse the header with the project-1 reader (copy or submodule), set up per-layer pointers. (3) Tokenizer (\code{tokenizer.bin} from \code{llama2.c}; encode/decode). (4) Kernels, naive versions only: \code{rmsnorm}, \code{rope} (both conventions behind a flag), \code{matvec\_naive}, \code{softmax}, \code{attention} (two-pass), \code{silu\_gate}. (5) \code{cf\_forward} for one token; \code{cf\_prefill} by looping tokens (slow, fine). (6) Golden tests: per-kernel against NumPy; 200 greedy tokens against the reference; logits at the last position for 5 prompts.\\
+\textbf{Acceptance.} Every golden test passes at the stated tolerances; a 200-token greedy generation from \code{stories110M} is identical to the reference; valgrind memcheck is clean on a 10-token run; ASan clean.\\
+\textbf{Feeds.} Post~2 setup; Post~2b's reference implementation.
+
+\assignment{A2.2}{The matvec ladder, R1--R4}{10 h}
+\textbf{Goal.} Four variants of \code{matvec} with a CPE table and roofline points.\\
+\textbf{Steps.} (1) \code{bench/bench\_matvec.c}: for a given variant and $m\times n$, time 50 repetitions after warm-up, report CPE (cycles per weight element) and GFLOP/s and GB/s; sizes matching \code{stories110M}'s matrices and one $4096\times 4096$. (2) Implement R1 (\code{naive}, measure), R2 (\code{unroll4}, measure---observe no gain), R3 (\code{acc8}, measure), R4 (\code{avx2}, \code{avx2\_acc4}, \code{avx2\_acc8}). (3) The accumulator sweep: a variant parameterized by $k=1..16$ accumulators (macro-generated), for Fig.~3. (4) Add each variant's point to the roofline script. (5) Equivalence tests for all variants.\\
+\textbf{Acceptance.} CPE table in the README with all variants; \code{acc8} $< 0.6\times$ naive, \code{avx2\_acc8} $< 0.25\times$ naive; the $k$-sweep shows a knee at $k \approx \lambda \times$ FMA units; for the $4096^2$ fp32 matrix, \code{avx2\_acc8} sits within 20\% of the bandwidth ceiling on the roofline (if it does not, you have found a problem worth a log entry).\\
+\textbf{Feeds.} Post~2 Fig.~2 points, Fig.~3, the mechanism section on dependency chains.
+
+\assignment{A2.3}{Quantized weights via \code{qnum}}{10 h}
+\textbf{Goal.} bf16, int8 and int4 weight paths and the tokens/s-vs-bytes figure.\\
+\textbf{Steps.} (1) Extend the exporter to emit bf16/int8/int4 weights (using \code{qnum} from Python via a small \code{ctypes} binding, or re-quantize in C at load time with \code{qn\_intq\_quantize}---the latter is simpler). (2) R5 \code{avx2\_bf16}; R6 \code{avx2\_int8} with per-group integer dot product (\code{\_mm256\_maddubs\_epi16}/\code{madd\_epi16}) and scale applied per group; R6 \code{avx2\_int4} with nibble unpacking. (3) \code{bench/bench\_decode.c}: tokens/s for a 256-token generation per weight type, single core and all cores; also the bound $\beta/(Pb_w)$ from \code{machine.md}. (4) Equivalence tests against naive-on-dequantized-weights. (5) Accuracy check: greedy outputs under int4 vs fp32 for 10 prompts (expect divergence after some tokens; report where).\\
+\textbf{Acceptance.} All equivalence tests pass; tokens/s roughly doubles from fp32 to bf16 and again to int8 on the large matrices (if it does not, the kernel is not bandwidth-bound yet---profile with \code{perf} before closing); figure of tokens/s vs bytes/weight with the bound drawn.\\
+\textbf{Feeds.} Post~2 central figure (Fig.~4) and the ``what this predicts'' section.
+
+\assignment{A2.4}{Attention and prefill}{12 h}
+\textbf{Goal.} Online-softmax blocked attention, a blocked GEMM for prefill, and the prefill-vs-decode curves.\\
+\textbf{Steps.} (1) Online-softmax attention processing keys in blocks of 32 with the $(m,l,o)$ update; ULP test against two-pass. (2) Fuse RoPE into the Q/K projection output. (3) GEMM ladder for prefill: \code{ijk}, \code{ikj}, \code{blocked} ($b\in\{16,32,48,64\}$), \code{blocked\_avx2} with the $6\times 16$ micro-kernel. (4) \code{cf\_prefill} using GEMM; causality test. (5) \code{bench/bench\_prefill.c}: throughput (tokens/s) vs $T\in\{1,2,4,\dots,512\}$; mark the ridge point. (6) \code{valgrind --tool=cachegrind} on one blocked vs unblocked run to compare simulated L1 miss rates with the arithmetic in the math section.\\
+\textbf{Acceptance.} Online-softmax ULP test passes; causality test passes; blocked GEMM reaches $\ge 50\%$ of peak FLOP/s on $1024^2$ (document the number if lower and why); prefill throughput crosses the decode throughput at a $T$ within a factor of 2 of the predicted $\AI^\ast b_w/2$.\\
+\textbf{Feeds.} Post~2 Fig.~5 and Fig.~6; all of Post~2b.
+
+\assignment{A2.5}{Hardware counters}{6 h}
+\textbf{Goal.} Confirm the bandwidth-bound diagnosis with counters, not inference from timing.\\
+\textbf{Steps.} (1) Wire \code{cf\_perf\_open} into \code{bench\_matvec} and \code{bench\_prefill}: cycles, instructions, L1D misses, LLC misses, dTLB misses. (2) IPC and bytes/cycle per kernel variant. (3) L1 miss rate vs block size $b$ for the GEMM. (4) Write the counter table into \code{docs/perf.md} with the \code{perf stat} invocations that reproduce them.\\
+\textbf{Acceptance.} For the decode matvec, measured DRAM bytes/s (from LLC misses $\times$ 64 B) is within 25\% of the timing-derived GB/s; the miss-rate-vs-$b$ curve has its minimum near the predicted $b \le \sqrt{C_{L1}/12}$.\\
+\textbf{Feeds.} Post~2 results section (the counter table that closes the argument).
+
+\section{Test plan}
+
+\begin{description}
+  \item[Kernel unit tests vs NumPy goldens] For \code{rmsnorm}, \code{rope} (both pairing conventions), \code{softmax} (including inputs with $|s|>100$ and all-equal inputs), \code{silu\_gate}: random inputs, outputs within $10^{-5}$ relative.
+  \item[Variant equivalence] Every \code{matvec}/\code{gemm} variant vs \code{naive} on random $W$, $x$ with $m,n \in\{1,7,8,9,64,65,1024\}$; tolerance $10^{-4}$ relative to $\|y\|$ (different association). For quantized variants, compare against \code{naive} applied to the \emph{dequantized} weights with tolerance $10^{-6}$ (same numbers, different order only).
+  \item[Online $=$ offline softmax] Attention with online softmax vs two-pass on random $K,V$ for $t \in \{1, 2, 31, 32, 33, 1000\}$: max ULP distance $\le 8$.
+  \item[Causality] Prefill logits at position $t$ equal single-token decode logits after feeding tokens $0..t$ one by one.
+  \item[End-to-end golden] 200 greedy tokens equal the Python reference (\code{scripts/golden\_logits.py} runs \code{llama2.c}'s \code{model.py} or HF); store logits of the last position for 5 prompts and compare with relative $10^{-4}$.
+  \item[Shape edge cases] $h_{kv} < h$ (GQA) with a synthetic random-weight config; $d_h$ not a multiple of 16.
+  \item[Performance regression] \code{bench\_matvec} prints CPE per variant; a test asserts \code{acc8} CPE $< 0.6\times$ \code{naive} CPE and \code{avx2\_acc8} $< 0.25\times$ (soft thresholds, skipped under sanitizers).
+  \item[Sanitizers] ASan/UBSan on the whole test suite; \code{valgrind --tool=cachegrind} on \code{bench\_matvec} once, to compare simulated vs measured miss rates.
+\end{description}
+
+\section{Measurements and blog briefs}
+
+(i) Memory mountain surface; (ii) roofline with one point per matvec variant and per weight type; (iii) tokens/s vs bytes/weight with the $\beta/(Pb_w)$ bound drawn; (iv) CPE vs number of accumulators $k=1..16$; (v) prefill throughput vs $T$ crossing the ridge; (vi) L1 miss rate vs block size $b$; (vii) the hardware-counter table.
+
+\begin{blogbox}
+\post{2} \textbf{``A roofline for LLM decode, measured from scratch on one CPU core''}
+
+\textbf{Audience and thesis.} For people who have heard ``decode is memory-bound'' and want to see the ceiling move. Thesis: decode is a bandwidth problem; you can watch the token rate track bytes-per-weight and stop exactly where the roofline says, and no FLOP optimization moves it. Subtitle: ``$X$ tokens/s fp32 $\to$ $Y$ int4 on one core, against a $\beta/(Pb_w)$ bound of $Z$''.
+
+\textbf{Length.} 2800--3300 words.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} The memory mountain: read throughput (GB/s, $z$) over working-set size (log $x$) and stride ($y$), as a surface or as a family of curves; plateaus labelled with the cache they correspond to.
+  \item \fig{2} (central) Roofline: GFLOP/s ($\log y$) vs arithmetic intensity ($\log x$); ceilings from A2.0; one point per matvec variant for the $4096^2$ matrix (fp32 ladder marching up the bandwidth slope) and per weight type (points moving right along the slope); the GEMM points up near the compute ceiling for contrast.
+  \item \fig{3} CPE vs number of accumulators $k=1..16$, scalar and AVX2, with the predicted $\max(\lambda/k, 1/\text{units})$ curve dashed.
+  \item \fig{4} Decode tokens/s ($y$) vs bytes per weight ($x$: 4, 2, 1, 0.5) for \code{stories110M}, with the bound $\beta/(Pb_w)$ as a dashed line; single-core and all-core series.
+  \item \fig{5} Prefill throughput vs $T$ (log $x$), with the ridge-point $T$ marked and decode throughput as a horizontal reference.
+  \item \fig{6} L1 miss rate vs block size $b$ from counters and from cachegrind, with the $\sqrt{C_{L1}/12}$ line.
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: three numbers (fp32, int4 tokens/s, the bound) and the claim.
+  \item Fig.~2, read aloud: what each point is and why they stop.
+  \item Setup: machine, model, flags, runs, tag.
+  \item The mountain (Fig.~1) and what each plateau costs; the latency numbers from pointer chasing.
+  \item The cost model: FLOPs and bytes per decode step, arithmetic intensity $2/b_w$, the ridge point with your machine's numbers; a worked example for \code{stories110M} giving the predicted tokens/s before any measurement.
+  \item Why one accumulator is slow: the dependency-chain argument, Fig.~3, and the code excerpt showing eight accumulators. Say explicitly that this changes the floating-point result and why the compiler will not do it for you.
+  \item Blocking for prefill: the miss-count arithmetic, Fig.~6, and the 6$\times$16 micro-kernel's register budget.
+  \item Quantized matvec: the int8 integer-dot-product trick in 12 lines; Fig.~4 and the sentence ``the bound was predicted in section 5 before the kernel existed''.
+  \item Prefill vs decode: Fig.~5 and the crossing.
+  \item The counter table: bytes/s from LLC misses vs from timing; IPC per variant. This is what makes the argument more than a curve fit.
+  \item What went wrong: the RoPE pairing convention; the first ``bandwidth-bound'' kernel that was actually latency-bound (how the $k$ sweep revealed it); turbo frequency drift between runs.
+  \item What this predicts: on an H100 with 3.3~TB/s and 8B params at 2 bytes, the same arithmetic gives $\sim$200 tokens/s per sequence---and why batching (project~6) is the only way past it; on a FLOPs-poor accelerator the ridge moves left and prefill becomes the problem instead. One falsifiable prediction.
+  \item Reproduce box: \code{make bench}, the three scripts, 20 minutes.
+\end{enumerate}
+
+\textbf{Code to show.} The 8-accumulator AVX2 dot product; the online-softmax update is saved for 2b; the int8 group dot product; the \code{perf\_event\_open} attribute setup (10 lines) because nobody shows it.
+
+\post{2b} \textbf{``Online softmax, explained with one invariant''}
+
+\textbf{Thesis.} The whole of FlashAttention's numerics is one invariant: after processing keys $0..u$, $(m, l, o)$ equals (max, sum of $e^{s-m}$, weighted sum of $V$ with weights $e^{s-m}$). \textbf{Length} 1200--1600 words. \textbf{Figures:} a diagram of the $(m,l,o)$ state being rescaled when a new maximum arrives; ULP-distance histogram between online and two-pass results for $t$ up to 4096. \textbf{Outline:} the stability problem ($e^{88.7}$ overflows); the two-pass version; the invariant and its proof by induction (write the rescaling step out); blocked processing as the same update with block-local statistics; the C implementation in 20 lines; the ULP histogram and why the differences are a few ULPs and not zero; what changes on a GPU (the block is a tile and the rescale is the expensive part). \textbf{What went wrong:} initializing $m$ to $0$ instead of $-\infty$ gives correct results on most inputs and wrong ones when all scores are negative---state how the test caught it.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} branches as pointers; fast-forward vs three-way merge; rebase and interactive rebase; \code{--force-with-lease}; stash; conflict resolution; manual \code{git bisect}.
+
+\textbf{Practice.}
+\begin{enumerate}
+  \item Each rung of the ladder is a branch: \code{git switch -c kern/avx2-acc8}. Commit freely, then \code{git rebase -i main} to \code{squash}/\code{fixup}/\code{reword} into 1--3 clean commits before merging. Inspect \code{.git/refs/heads/} to see the branch pointer move.
+  \item Merge with \code{git switch main \&\& git merge --ff-only kern/avx2-acc8}. When \code{--ff-only} refuses (main moved), rebase the branch first: linear history keeps \code{bisect} simple.
+  \item Deliberately create a conflict: change the same line of \code{kernels.h} on two branches; resolve with \code{git diff}, the conflict markers, \code{git add}, \code{git rebase --continue}. Learn \code{git merge --abort} / \code{rebase --abort}.
+  \item Pushing a rebased branch requires \code{git push --force-with-lease origin kern/avx2-acc8}---never plain \code{--force}, never on \code{main}. \code{--force-with-lease} refuses if the remote moved since your last fetch.
+  \item \code{git stash} (\code{push -m "wip rope"}, \code{list}, \code{pop}) to switch branches with a dirty tree.
+  \item Plant a performance regression on purpose (e.g.\ reintroduce one accumulator in a middle commit), then find it with \code{git bisect start; git bisect bad; git bisect good v0.1.0}, running \code{bench\_matvec} at each step and marking \code{good}/\code{bad}. Project~5 automates this.
+  \item Tag \code{v0.2.0} when A2.4 closes.
+\end{enumerate}
+\end{gitbox}

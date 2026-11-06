@@ -1,0 +1,375 @@
+\chapter{Project 1: \code{qnum} --- a low-precision numerics library}
+\label{ch:p1}
+
+\section{Goal}
+
+A C library implementing every number format that matters for inference---fp16, bf16, fp8 (E4M3 and E5M2), symmetric and asymmetric integer quantization (int8, int4 with per-group scales), and block floating point---with conversions to and from fp32 written purely with integer bit manipulation, every rounding mode, correct handling of subnormals, infinities, NaNs and saturation, and a measurement suite that quantifies the error each format introduces on real model weights.
+
+\begin{hook}
+KV-cache compression, weight quantization, and the accelerator formats you will meet at Tenstorrent (block floating point) or on Hopper/Blackwell (fp8, fp4 with micro-scaling) all reduce to the bit manipulations in this project. It is also the place where compiler and architecture differences first become visible in numerical output---the same question as your WRF compiler study, at the scale of one instruction.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{2.1} bit-level ops, shifts, byte order & all encoders/decoders; the safetensors header is little-endian \\
+\ch{2.2}--2.3 integer encodings, overflow & integer quantization, saturation, two's-complement int4 packing \\
+\ch{2.4} IEEE floating point, rounding & every float format in this chapter \\
+\ch{3.1}--3.6 x86-64 asm, control & reading \code{objdump} of your converters at \code{-O0}/\code{-O2} \\
+\ch{3.11} floating-point code (SSE/AVX) & comparing against \code{vcvtps2ph}, \code{vcvtneps2bf16} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Mathematical background}
+
+\subsection{Binary floating-point formats}
+
+A binary floating-point format with $w$ exponent bits and $p-1$ stored fraction bits ($p$ is the \emph{precision}, counting the hidden leading 1) encodes a sign $s$, a biased exponent $e\in[0,2^w-1]$ and a fraction $f\in[0,2^{p-1})$ with bias $b = 2^{w-1}-1$:
+\begin{equation}
+x = \begin{cases}
+(-1)^s \,(1 + f\,2^{-(p-1)})\, 2^{\,e-b}            & 1 \le e \le 2^w-2 \quad\text{(normal)}\\
+(-1)^s \,(f\,2^{-(p-1)})\, 2^{\,1-b}                   & e = 0,\ f \ne 0 \quad\text{(subnormal)}\\
+(-1)^s \, 0                                             & e = 0,\ f = 0\\
+(-1)^s \, \infty                                        & e = 2^w-1,\ f = 0\\
+\text{NaN}                                              & e = 2^w-1,\ f \ne 0
+\end{cases}
+\label{eq:ieee}
+\end{equation}
+Subnormals have the same spacing $2^{1-b-(p-1)}$ as the smallest normals (\emph{gradual underflow}), which is why IEEE formats are monotone in their bit patterns: for non-negative values, $x \le y \iff \text{bits}(x) \le \text{bits}(y)$ when the bits are read as unsigned integers. This fact is the basis of your ULP comparison and of several tests.
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}lcccclll@{}}
+\toprule
+Format & $s$ & $w$ & $p-1$ & bias & max finite & min normal / min subnormal & $\infty$, NaN \\
+\midrule
+fp32 & 1 & 8  & 23 & 127 & $\approx 3.40\mathrm{e}38$ & $2^{-126}$ / $2^{-149}$ & IEEE \\
+fp16 & 1 & 5  & 10 & 15  & $65504$ & $2^{-14}$ / $2^{-24}$ & IEEE \\
+bf16 & 1 & 8  & 7  & 127 & $\approx 3.39\mathrm{e}38$ & $2^{-126}$ / $2^{-133}$ & IEEE \\
+E5M2 & 1 & 5  & 2  & 15  & $57344 = 1.75\cdot 2^{15}$ & $2^{-14}$ / $2^{-16}$ & IEEE \\
+E4M3 & 1 & 4  & 3  & 7   & $448 = 1.75\cdot 2^{8}$ & $2^{-6}$ / $2^{-9}$ & no $\infty$; NaN $=s.1111.111$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+E4M3 (OCP FP8 specification) is \emph{not} IEEE-shaped: the top exponent $e=15$ is used for finite values ($448 = 1.111_2 \cdot 2^{8}$ with $f=111$) except the single pattern $f=111$, which is NaN. There are no infinities; overflow produces NaN (or saturates to $\pm 448$ in \emph{saturating} mode---implement both as a flag). E5M2 is exactly binary16 with 8 fewer fraction bits and behaves like IEEE.
+
+bf16 is the upper 16 bits of fp32: same exponent field, 7 fraction bits. Conversion is therefore a pure rounding of the low 16 bits with no exponent-range handling.
+
+\textbf{Unit roundoff.} With round-to-nearest the relative error of representing a real $x$ in the normal range is bounded by $u = 2^{-p}$:
+\begin{equation}
+\left|\frac{\hat{x}-x}{x}\right| \le u = 2^{-p}.
+\end{equation}
+Thus $u_{\text{fp32}}=2^{-24}\approx 6\mathrm{e}{-8}$, $u_{\text{fp16}}=2^{-11}\approx 4.9\mathrm{e}{-4}$, $u_{\text{bf16}}=2^{-8}\approx 3.9\mathrm{e}{-3}$, $u_{\text{E4M3}}=2^{-4}=6.25\%$, $u_{\text{E5M2}}=2^{-3}=12.5\%$. The two fp8 formats trade range (E5M2) against precision (E4M3); your measurements on real weights should show E4M3 winning for weights and E5M2 for gradients/activations with outliers.
+
+\subsection{Rounding by integer arithmetic}
+
+Let $X$ be the 32-bit unsigned integer whose bits are the fp32 value $x$, and suppose we keep the top $k$ fraction bits and drop $d = 23 - k$. Write $X = Q\cdot 2^d + R$ with $R = X \bmod 2^d$ the discarded bits and $H = 2^{d-1}$ the halfway point.
+
+\begin{description}
+  \item[Round toward zero (truncation)] $Q$.
+  \item[Round to nearest, ties to even (RNE)]
+  \begin{equation}
+    Q_{\text{RNE}} = \left\lfloor \frac{X + H - 1 + (Q \bmod 2)}{2^d} \right\rfloor .
+    \label{eq:rne}
+  \end{equation}
+  Check the three cases: $R<H$ adds less than $2^d$ to $Q2^d$, so the floor is $Q$; $R>H$ pushes past the boundary, giving $Q+1$; $R=H$ adds exactly $2^d - 1 + (Q\bmod 2)$, which crosses only when $Q$ is odd---rounding to the even neighbour. The familiar bf16 idiom \code{(X + 0x7FFF + ((X >> 16) \& 1)) >> 16} is Equation~\eqref{eq:rne} with $d=16$.
+  \item[Stochastic rounding] draw $U$ uniform on $\{0,\dots,2^d-1\}$ and return $\lfloor (X+U)/2^d \rfloor$. Then $\Pr[\text{round up}] = R/2^d$ and $\E[\hat{x}] = x$ exactly---the estimator is unbiased, which is why it matters for training and for accumulating many small updates, and why it is useless for a single weight tensor (it adds variance without benefit). Use a 64-bit PCG or xoshiro256 generator; never \code{rand()}.
+\end{description}
+
+\textbf{Carry propagation is a feature.} When $Q$'s fraction field is all ones and rounding adds one, the carry propagates into the exponent field: $1.111\ldots \to 10.000\ldots$ renormalizes to $1.000\times 2^{e+1}$, which is exactly right. The same carry turns the largest finite value into infinity for IEEE formats---also right. For E4M3 the carry would produce the NaN pattern, so you must detect overflow (compare against the max-finite bit pattern) \emph{before} packing.
+
+\subsection{Narrowing the exponent range (fp32 $\to$ fp16/fp8)}
+
+bf16 shares fp32's exponent, so Equation~\eqref{eq:rne} is the whole conversion. For fp16 and fp8 the target has a smaller exponent range and the algorithm is:
+
+\begin{enumerate}
+  \item Extract $s$, $e$, $f$ from $X$. Handle $e = 255$ separately: $\pm\infty\to\pm\infty$ (E4M3: NaN or saturate), NaN $\to$ a quiet NaN of the target (keep the sign, set the top fraction bit, keep at least one fraction bit set).
+  \item Compute the unbiased exponent $E = e - 127$ (for fp32 subnormals, $E = -126$ and the hidden bit is 0; for the formats here every fp32 subnormal underflows to $\pm 0$ in the target, so you may short-circuit).
+  \item Form the 24-bit significand $M = 2^{23} + f$.
+  \item Let $E_{\min} = 1 - b_t$ be the target's minimum normal exponent.
+    \begin{itemize}
+      \item If $E > E_{\max}$ (after rounding; see step 6): overflow $\to \pm\infty$ or saturate.
+      \item If $E \ge E_{\min}$: \emph{normal path}. Drop $d = 23 - (p_t-1)$ bits of $M$ with the chosen rounding; the target biased exponent is $E + b_t$; if rounding carried out of the significand, the carry lands in the exponent (correct).
+      \item If $E < E_{\min}$: \emph{subnormal path}. The target can only represent multiples of $2^{E_{\min}-(p_t-1)}$. Shift $M$ right by $d + (E_{\min} - E)$ bits with rounding---the extra shift is exactly how many binary places $x$ is below the normal range. The target exponent field is 0. If the shift exceeds $24$ bits the result is $\pm 0$ (or the smallest subnormal with probability $R/2^d$ under stochastic rounding). If rounding carries into bit $p_t-1$, the value becomes the smallest normal: the exponent field becomes 1, again by the natural carry if you build the packed value as \code{(exp << (p\_t-1)) + rounded\_sig}.
+    \end{itemize}
+  \item Pack $s$, exponent, fraction.
+  \item Overflow check: compare the packed magnitude against the format's maximum finite pattern (fp16: \code{0x7BFF}; E5M2: \code{0x7B}; E4M3: \code{0x7E}). Anything greater is overflow.
+\end{enumerate}
+
+The widening direction (fp16 $\to$ fp32) is simpler: normals re-bias the exponent ($e_{32} = e_{16} - 15 + 127$) and shift the fraction left by 13; subnormals need normalization---find the leading one with \code{\_\_builtin\_clz}, shift it into the hidden position, and set $e_{32} = 127 - 14 - \text{shift}$; infinities and NaNs map to $e_{32}=255$ with the fraction shifted left.
+
+\subsection{Integer quantization}
+
+Given a group $x_1,\dots,x_g$ of fp32 values and $B$ bits:
+
+\textbf{Symmetric.} $q_{\max} = 2^{B-1}-1$ ($7$ for int4, $127$ for int8); the full negative range $-2^{B-1}$ is deliberately unused so that the grid is symmetric.
+\begin{equation}
+  \Delta = \frac{\max_i |x_i|}{q_{\max}},\qquad
+  q_i = \clamp\!\left(\round\!\left(\frac{x_i}{\Delta}\right), -q_{\max}, q_{\max}\right),\qquad
+  \hat{x}_i = \Delta\, q_i .
+\end{equation}
+
+\textbf{Asymmetric (with zero point).} Uses the full range $[0, 2^B-1]$:
+\begin{align}
+  \Delta &= \frac{\max_i x_i - \min_i x_i}{2^B - 1},\qquad
+  z = \round\!\left(-\frac{\min_i x_i}{\Delta}\right),\\
+  q_i &= \clamp\!\left(\round\!\left(\frac{x_i}{\Delta}\right) + z,\ 0,\ 2^B-1\right),\qquad
+  \hat{x}_i = \Delta\,(q_i - z).
+\end{align}
+Store $\Delta$ as bf16 or fp16 and $z$ as a $B$-bit unsigned. Storage cost per weight with group size $g$ and a 16-bit scale is $B + 16/g$ bits (int4, $g=32$: $4.5$ bits; with an 8-bit zero point: $4.75$).
+
+\textbf{Error.} Within the clipping range the error $x_i - \hat{x}_i$ is approximately uniform on $[-\Delta/2, \Delta/2]$, so
+\begin{equation}
+  \E\big[(x-\hat{x})^2\big] = \frac{\Delta^2}{12},
+  \qquad
+  \text{SQNR} = 10\log_{10}\frac{\sum_i x_i^2}{\sum_i (x_i-\hat{x}_i)^2}\ \text{dB}.
+\end{equation}
+Because $\Delta$ is set by the group's largest magnitude, one outlier inflates $\Delta$ for its whole group and crushes the small values; smaller groups contain the damage at the cost of more scale bits. Your measurement suite should plot SQNR against $g$ for real weight matrices and show exactly this trade-off.
+
+\textbf{Packing int4.} Two's-complement nibbles, element $2j$ in the low nibble of byte $j$ and $2j+1$ in the high nibble. Unpacking requires sign extension: \code{(int8\_t)(n << 4) >> 4} for the low nibble is the standard idiom (arithmetic right shift of a signed value---\ch{2.3}; note that right-shifting negative signed integers is implementation-defined in C17 but arithmetic on every compiler you will use; say so in a comment).
+
+\subsection{Block floating point}
+
+A block floating-point (BFP) format shares one exponent among a block of $n$ elements and stores a short signed mantissa per element. Tenstorrent's BFP8/BFP4/BFP2 formats are of this kind (blocks of 16 with an 8-bit shared exponent and 8/4/2-bit elements). Implement the general family $\mathrm{BFP}(m, n)$: $n$ elements, each a sign bit plus an $m$-bit mantissa \emph{with an explicit leading one} (no hidden bit, because small elements will have leading zeros after alignment), and an 8-bit shared biased exponent.
+
+Encoding a block $x_1,\dots,x_n$ with fp32 exponents $e_i$ (biased) and 24-bit significands $M_i$:
+\begin{align}
+  e_s &= \max_i e_i \quad\text{(shared exponent)},\\
+  \tilde{M}_i &= \round\!\left( M_i \cdot 2^{-(24-m)} \cdot 2^{-(e_s - e_i)} \right) \quad\text{(align to shared exponent, keep $m$ bits)},\\
+  \hat{x}_i &= (-1)^{s_i}\, \tilde{M}_i\, 2^{\,e_s - 127 - (m-1)} .
+\end{align}
+Elements with $e_s - e_i \ge m$ become zero. Storage is $m + 1 + 8/n$ bits per element: $\mathrm{BFP}(7,16)$ costs $8.5$ bits.
+
+\textbf{Error.} The absolute error of every element in the block is at most half a unit of the block's grid, $\tfrac12 2^{e_s-127-(m-1)}$, so the \emph{relative} error of element $i$ is roughly
+\begin{equation}
+  \left|\frac{\hat{x}_i - x_i}{x_i}\right| \lesssim 2^{\,(e_s - e_i) - m},
+\end{equation}
+i.e.\ it doubles for every octave an element sits below the block maximum. This is the same outlier sensitivity as group integer quantization (BFP is, in fact, integer-group quantization with a power-of-two scale), and the comparison between BFP($7,16$) and int8-with-fp16-scale-per-16 is a natural figure for your blog.
+
+\subsection{Comparing floats: ULPs}
+
+For two finite floats of the same sign, the number of representable values between them is $|\text{bits}(a) - \text{bits}(b)|$ as integers. For mixed signs, map each to a signed ordering key $k(x) = \text{bits}(x)$ if $x \ge 0$ else $-(\text{bits}(x) \wedge \text{0x7FFFFFFF})$, then take $|k(a)-k(b)|$. Implement this as \code{qn\_ulp\_distance} and use it in \code{CK\_ASSERT\_ULP}.
+
+\subsection{The safetensors container}
+
+A safetensors file is: an 8-byte little-endian unsigned header length $N$; $N$ bytes of JSON mapping tensor names to \code{\{dtype, shape, data\_offsets:[begin,end]\}}; then the raw little-endian tensor bytes, offsets relative to the end of the header. Reading it needs \code{mmap} (or \code{fread}) and a minimal JSON parser; writing a 200-line recursive-descent JSON parser is worthwhile, or vendor \code{jsmn}. Weights for testing: export a small Hugging Face model with \code{safetensors.torch.save\_file}, or use the \code{stories15M} checkpoint from \code{llama2.c} converted by a script you write in \code{scripts/}.
+
+\section{Architecture}
+
+\subsection{Directory layout}
+
+\begin{lstlisting}[style=plain]
+qnum/
+  include/qnum/
+    fp.h          fp16, bf16, e4m3, e5m2 <-> fp32; rounding modes; classification
+    intq.h        int8/int4 symmetric & asymmetric group quantization, packing
+    bfp.h         block floating point encode/decode
+    stats.h       error metrics: max abs, rmse, sqnr, ulp histograms
+    rng.h         PCG32/xoshiro256** for stochastic rounding
+    safetensors.h minimal reader
+    ulp.h         ordering key and ULP distance
+  src/            fp.c intq.c bfp.c stats.c rng.c safetensors.c json.c
+  tests/          test_fp16.c test_bf16.c test_fp8.c test_intq.c test_bfp.c test_stats.c test_safetensors.c
+  bench/          bench_convert.c   (throughput of each converter, scalar vs intrinsics)
+  scripts/        gen_golden.py (numpy/torch reference tables), plot_sqnr.py, export_weights.py
+  docs/           machine.md design.md blog.md
+\end{lstlisting}
+
+\subsection{Public API}
+
+\begin{lstlisting}[style=c]
+/* fp.h */
+typedef uint16_t qn_f16;  typedef uint16_t qn_bf16;
+typedef uint8_t  qn_e4m3; typedef uint8_t  qn_e5m2;
+typedef enum { QN_RNE = 0, QN_RTZ, QN_STOCHASTIC } qn_round;
+typedef struct { bool saturate; } qn_fp8_opts;   /* E4M3 overflow: NaN (default) or +-448 */
+typedef struct qn_rng qn_rng;                     /* rng.h: PCG32 state */
+
+qn_f16  qn_f32_to_f16 (float x, qn_round r, qn_rng *rng);
+qn_bf16 qn_f32_to_bf16(float x, qn_round r, qn_rng *rng);
+qn_e4m3 qn_f32_to_e4m3(float x, qn_round r, qn_rng *rng, qn_fp8_opts o);
+qn_e5m2 qn_f32_to_e5m2(float x, qn_round r, qn_rng *rng);
+float   qn_f16_to_f32 (qn_f16 h);
+float   qn_bf16_to_f32(qn_bf16 h);
+float   qn_e4m3_to_f32(qn_e4m3 h);
+float   qn_e5m2_to_f32(qn_e5m2 h);
+
+/* bulk versions: n elements, may use F16C/AVX-512 when compiled with -march=native */
+void qn_f32_to_f16_n(const float *x, qn_f16 *y, size_t n, qn_round r, qn_rng *rng);
+void qn_f16_to_f32_n(const qn_f16 *x, float *y, size_t n);
+/* ... same for bf16, e4m3, e5m2 ... */
+
+/* classification, format-generic */
+typedef struct { uint8_t exp_bits, frac_bits; int bias; bool has_inf; } qn_fmt;
+extern const qn_fmt QN_FMT_F16, QN_FMT_BF16, QN_FMT_E4M3, QN_FMT_E5M2;
+bool qn_is_nan(uint32_t bits, qn_fmt f);  bool qn_is_inf(uint32_t bits, qn_fmt f);
+bool qn_is_subnormal(uint32_t bits, qn_fmt f);
+\end{lstlisting}
+
+\begin{lstlisting}[style=c]
+/* intq.h */
+typedef struct {
+  uint8_t  bits;        /* 4 or 8 */
+  bool     symmetric;
+  size_t   group;       /* elements per scale, e.g. 32, 64, 128; 0 = per-tensor */
+} qn_intq_cfg;
+
+typedef struct {
+  qn_intq_cfg cfg;
+  size_t   n;
+  uint8_t *q;           /* packed: int8 -> n bytes; int4 -> ceil(n/2) bytes */
+  qn_bf16 *scale;       /* ceil(n/group) scales */
+  uint8_t *zero;        /* asymmetric only, ceil(n/group) entries */
+} qn_intq_tensor;
+
+size_t qn_intq_bytes(qn_intq_cfg c, size_t n);            /* total storage incl. metadata */
+void   qn_intq_quantize(const float *x, size_t n, qn_intq_cfg c, qn_intq_tensor *out);
+void   qn_intq_dequantize(const qn_intq_tensor *t, float *x);
+int8_t qn_int4_unpack_lo(uint8_t b);  int8_t qn_int4_unpack_hi(uint8_t b);
+uint8_t qn_int4_pack(int8_t lo, int8_t hi);
+
+/* bfp.h */
+typedef struct { uint8_t mant_bits; uint16_t block; } qn_bfp_cfg;   /* e.g. {7,16} */
+void qn_bfp_encode(const float *x, size_t n, qn_bfp_cfg c, qn_round r,
+                   uint8_t *shared_exp /* ceil(n/block) */, uint8_t *mant /* n */);
+void qn_bfp_decode(const uint8_t *shared_exp, const uint8_t *mant, size_t n,
+                   qn_bfp_cfg c, float *x);
+
+/* stats.h */
+typedef struct { double max_abs, rmse, mean_rel, sqnr_db; uint64_t ulp_hist[33]; } qn_err;
+qn_err qn_compare(const float *ref, const float *approx, size_t n);
+
+/* ulp.h */
+int32_t  qn_order_key(float x);
+uint32_t qn_ulp_distance(float a, float b);
+\end{lstlisting}
+
+\subsection{Implementation notes}
+
+\begin{itemize}
+  \item Type punning float$\leftrightarrow$uint32 goes through \code{memcpy} (the compiler turns it into a register move); never through a pointer cast, which violates strict aliasing.
+  \item Write the scalar converters first in a single generic routine parameterized by \code{qn\_fmt}, then specialize once it is tested; the specializations must be bit-identical to the generic one (a test).
+  \item The bulk functions dispatch at runtime on \code{\_\_builtin\_cpu\_supports("f16c")} / \code{"avx512bf16"} to intrinsics (\code{\_mm256\_cvtps\_ph} with \code{\_MM\_FROUND\_TO\_NEAREST\_INT}, \code{\_mm512\_cvtneps\_pbh}) and fall back to the scalar path. The intrinsics are the oracle for your scalar code, not the other way round.
+  \item Make the library allocation-free: callers own buffers; \code{qn\_intq\_bytes} tells them how much to allocate.
+\end{itemize}
+
+\section{Assignments}
+
+\assignment{A1.1}{Repository, harness, build}{6 h}
+\textbf{Goal.} A repository that builds with both compilers under all four \code{BUILD} variants, runs an (empty) test suite, and is published.\\
+\textbf{Steps.} (1) Create the layout from Section~\ref{ch:infra}; write \code{.gitignore} first. (2) Write \code{ck.h}: the macros, constructor-based registration, \code{--filter}, \code{--list}, a summary line, non-zero exit on failure. (3) Makefile with the variant logic and \code{-MMD} dependencies. (4) \code{tests/test\_ck.c} that tests the harness itself: a passing assertion, a deliberately failing one guarded by an environment variable, and \code{CK\_ASSERT\_ULP} on adjacent floats. (5) README with the five questions answered, headline number marked ``TBD''. (6) \code{docs/machine.md} with \code{lscpu}/cache sizes. (7) First commit and push.\\
+\textbf{Acceptance.} \code{make test} and \code{make BUILD=asan test} pass with \code{CC=gcc} and \code{CC=clang}; \code{-Wconversion} produces no warnings; \code{objdump -s -j .init\_array} on the test binary shows one entry per test; tag \code{v0.0.1} is on GitHub.\\
+\textbf{Feeds.} Nothing directly; the harness serves all six projects.
+
+\assignment{A1.2}{fp16 and bf16, both directions, three rounding modes}{12 h}
+\textbf{Goal.} Bit-exact conversions between fp32 and the two 16-bit formats, verified exhaustively.\\
+\textbf{Steps.} (1) \code{ulp.h}: ordering key and ULP distance; test on hand-picked pairs including $\pm 0$ and sign changes. (2) \code{rng.h}: PCG32 with seed and a \code{next\_bits(d)} helper. (3) The generic narrowing routine parameterized by \code{qn\_fmt}, implementing the six-step algorithm of Section~\ref{ch:p1} literally, RTZ first, then RNE (Equation~\eqref{eq:rne}), then stochastic. (4) Widening for both formats, including subnormal normalization with \code{\_\_builtin\_clz}. (5) \code{scripts/gen\_golden.py} producing \code{tests/golden/f16.csv} and \code{bf16.csv} (random plus the edge-case list). (6) The exhaustive, golden, monotonicity, ties and stochastic tests. (7) Specialize the hot paths once the generic routine is green; add the bit-identity test between generic and specialized.\\
+\textbf{Acceptance.} All $2^{16}$ round trips for both formats; goldens match; monotonicity over $10^6$ pairs; tie cases round to even in both carry directions; stochastic means within $4\sigma$; the specialized paths equal the generic one on $2^{24}$ random inputs; ASan clean. Commit per step; tag \code{v0.1.0}.\\
+\textbf{Feeds.} Post~1 sections 5--6 (mechanism), the RNE proof, the worked subnormal example; Post~1b's method.
+
+\assignment{A1.3}{fp8: E4M3 and E5M2}{8 h}
+\textbf{Goal.} The two OCP fp8 formats, with E4M3's non-IEEE top binade and both overflow behaviours.\\
+\textbf{Steps.} (1) Add the two \code{qn\_fmt} entries and the \code{has\_inf} flag. (2) Implement the E4M3 overflow check against \code{0x7E} before packing; implement the saturating option. (3) NaN canonicalization for a format with a single NaN pattern. (4) Goldens from \code{torch.float8\_e4m3fn} and \code{float8\_e5m2} (note that \code{e4m3fn} is the no-infinity variant---say so in a comment). (5) Exhaustive $2^8$ round trips, overflow-by-one-ULP cases, subnormal boundary cases ($2^{-9}$, $2^{-16}$ and their halves).\\
+\textbf{Acceptance.} Goldens match in both overflow modes; every E4M3 pattern except \code{0x7F}/\code{0xFF} round-trips; a value $448 + \tfrac12\ulp$ becomes NaN (non-saturating) or $448$ (saturating); fp32 values in $[2^{-10}, 2^{-9})$ round to $0$ or $2^{-9}$ exactly as RNE dictates.\\
+\textbf{Feeds.} Post~1 section 7 (``why E4M3 has no infinity'') and the range-vs-precision figure.
+
+\assignment{A1.4}{Integer group quantization and block floating point}{10 h}
+\textbf{Goal.} int8/int4 symmetric and asymmetric group quantizers with packing, and the $\mathrm{BFP}(m,n)$ family.\\
+\textbf{Steps.} (1) \code{qn\_intq\_bytes} and the storage layout (document it in the header). (2) Symmetric quantizer, then asymmetric; scales stored as bf16 via A1.2. (3) int4 pack/unpack with the sign-extension idiom and a comment on implementation-defined right shifts. (4) BFP encode: per-block max exponent, alignment shifts, rounding, explicit leading one; decode. (5) Property tests from the test plan; a test that $n$ not divisible by the group size is handled. (6) \code{qn\_compare} in \code{stats.h} with the ULP histogram.\\
+\textbf{Acceptance.} All quantization tests pass; \code{qn\_intq\_bytes} matches the $B + 16/g$ formula; BFP encode/decode idempotent; \code{qn\_compare} on known inputs gives the expected SQNR to $0.01$ dB.\\
+\textbf{Feeds.} Post~1 sections 8--9 (BFP as integer quantization with power-of-two scales), the $e_s - e_i$ histogram.
+
+\assignment{A1.5}{Measurement suite on a real checkpoint}{10 h}
+\textbf{Goal.} A table and three figures quantifying every format on real weights.\\
+\textbf{Steps.} (1) Minimal JSON parser (or vendor \code{jsmn}) and the safetensors reader; \code{scripts/export\_weights.py} converting \code{stories110M} (and optionally TinyLlama) to safetensors. (2) \code{bench/quant\_report.c}: for every 2-D tensor and every format/group configuration, compute \code{qn\_compare} on the weights and the relative Frobenius error of $W\hat{x}$ for 16 random $x$. Write a CSV. (3) \code{scripts/plot\_sqnr.py}: SQNR vs bits-per-weight scatter (one point per configuration, colour by format); SQNR by layer type; $e_s - e_i$ histograms for an attention and an MLP matrix. (4) Headline number into the README.\\
+\textbf{Acceptance.} CSV with one row per (tensor, format, group); the three figures in \code{docs/figures/} regenerate from the CSV by one command; README headline updated; \code{docs/log.md} has the surprising rows noted.\\
+\textbf{Feeds.} Post~1 central figure and results section.
+
+\assignment{A1.6}{Assembly study and hardware oracles}{8 h}
+\textbf{Goal.} Read what the compiler does with your converter; make the hardware instruction the oracle for your software.\\
+\textbf{Steps.} (1) \code{objdump -d -M intel} of \code{qn\_f32\_to\_bf16} at \code{-O0}, \code{-O2}, \code{-O2 -march=native}, for gcc and clang; paste and annotate in \code{docs/asm-notes.md}: where the rounding add is, whether a branch survived for NaN, what \code{-march=native} changed. (2) Add the F16C/AVX-512-BF16 fast paths with runtime dispatch. (3) \code{bench/exhaustive\_f16.c}: all $2^{32}$ fp32 inputs through scalar RNE vs \code{\_mm256\_cvtps\_ph}; report mismatches (expect zero) and wall time. (4) \code{bench/bench\_convert.c}: GB/s for scalar \code{-O0}, scalar \code{-O2}, intrinsics, for each format.\\
+\textbf{Acceptance.} Zero mismatches over $2^{32}$ (document the runtime); throughput table in the README; the annotated assembly explains at least three differences between \code{-O0} and \code{-O2}.\\
+\textbf{Feeds.} Post~1 section 10 (compiler aside) and all of Post~1b.
+
+\section{Test plan}
+
+\begin{description}
+  \item[Exhaustive round trips] For all $2^{16}$ fp16 patterns: \code{f32\_to\_f16(f16\_to\_f32(h)) == h} for every non-NaN $h$; NaNs stay NaN. Same for bf16 and for both fp8 formats ($2^8$ patterns).
+  \item[Exhaustive against the oracle] For all $2^{16}$ \emph{fp16} values widened to fp32 and then re-narrowed under RNE, every rounding mode agrees (there is nothing to round). For $2^{24}$ random fp32 values compare the scalar path to the F16C intrinsic (skip with \code{CK\_SKIP} when the CPU lacks it); the full $2^{32}$ sweep lives in \code{bench/}.
+  \item[Golden tables] \code{scripts/gen\_golden.py} writes CSVs of (fp32 bits, expected fp16/bf16 bits) using \code{numpy.float16} and \code{torch.bfloat16}, plus fp8 via \code{torch.float8\_e4m3fn}/\code{e5m2}, including hand-picked edge cases: $\pm0$, smallest subnormal, largest subnormal, smallest normal, max finite, max finite $+\frac12\ulp$, ties at every magnitude, values that round up into the next binade, values that overflow by one ULP, NaN payloads.
+  \item[Monotonicity] For 10$^6$ random pairs $a\le b$ (finite, non-NaN): \code{to\_f16(a) <= to\_f16(b)} under the ordering key, for every format and RNE/RTZ.
+  \item[Ties to even] Construct values exactly halfway between two fp16 neighbours; check even results in both directions of the carry (including $1.111\ldots1\!\mid\!1 \to 10.000$ at a binade boundary).
+  \item[Stochastic rounding] For 100 values, $10^6$ draws each: sample mean within $4\sigma$ of $x$ where $\sigma = \Delta\sqrt{p(1-p)/10^6}$ and $p = R/2^d$. Also: with $R=0$ the result never changes.
+  \item[Integer quantization] Dequantization error $\le \Delta/2 + \epsilon$ for every in-range element; clipping only when $|x| > q_{\max}\Delta$ (never, for symmetric); int4 pack/unpack identity for all 256 byte values; group boundaries (n not a multiple of the group size).
+  \item[BFP] Elements equal to the block max are exact to $m$ bits; an element $m$ octaves below the max decodes to zero; encode/decode is idempotent (encode(decode(encode($x$))) $=$ encode($x$)).
+  \item[Stats] \code{qn\_compare} on identical arrays gives zero error and SQNR $=+\infty$ (represent as \code{INFINITY}); on $x$ vs $x(1+10^{-3})$ gives SQNR $\approx 60$ dB.
+  \item[Safetensors] A file written by Python round-trips: names, dtypes, shapes, and a checksum of each tensor's bytes.
+  \item[Sanitizers] \code{make BUILD=asan test} clean; \code{-Wconversion} clean (this is where you will discover implicit int promotions in shift expressions).
+\end{description}
+
+\section{Measurements and blog briefs}
+
+Produce with \code{bench/} and \code{scripts/}: (i) SQNR per layer for bf16, fp16, E4M3, E5M2, int8 ($g=\{32,128,\text{tensor}\}$), int4 ($g=\{32,64,128\}$), BFP($7,16$), BFP($3,16$); (ii) the distribution of $e_s - e_i$ within BFP blocks for attention vs MLP weights; (iii) conversion throughput in GB/s for scalar \code{-O0}, scalar \code{-O2}, intrinsics; (iv) the end-to-end effect: relative Frobenius error of $W\hat{x}$ vs $Wx$ for a few layers.
+
+\begin{blogbox}
+\post{1} \textbf{``Every inference number format, from the bits up''}
+
+\textbf{Audience and thesis.} For people who use \code{torch.bfloat16} or \code{--quantization awq} daily without having written a rounding routine. Thesis: all low-precision formats are one algorithm---align, round, pack---with different constants, and they all fail the same way: the largest value in a group sets the grid for the smallest. Subtitle carries the headline: e.g.\ ``int4 with 32-element groups keeps 38 dB on \code{stories110M}; BFP8 keeps 41 dB at twice the bits''.
+
+\textbf{Length.} 3000--3500 words; this is the longest post because it carries the most derivation.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} (central) SQNR (dB, $y$) vs bits per weight ($x$, $3$--$16$), one marker per (format, group size), colour by family (float/int/BFP), averaged over all 2-D tensors with min--max whiskers. Caption states which format wins at each bit budget.
+  \item \fig{2} Bit-layout diagram of the five float formats side by side (an SVG you draw), with the hidden bit and the bias annotated.
+  \item \fig{3} Number line of representable values near $1.0$ for fp16, bf16, E4M3, E5M2 (log $x$), showing spacing; this is what makes ``unit roundoff'' visible.
+  \item \fig{4} Histogram of $e_s - e_i$ (octaves below block max) for one attention and one MLP matrix, with the ``bits lost'' axis on top.
+  \item \fig{5} SQNR vs group size $g$ for int4 and int8, showing the $16/g$ scale overhead on a secondary axis.
+  \item \fig{6} Conversion throughput (GB/s) bar chart: scalar \code{-O0}, scalar \code{-O2}, F16C, per format.
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: the one algorithm, the one failure mode, the headline number.
+  \item Fig.~1 and its reading.
+  \item Setup: checkpoint, which tensors, how SQNR is computed, tag.
+  \item IEEE encoding (Equation~\eqref{eq:ieee}) with Fig.~2; the monotonicity-of-bit-patterns fact and why it matters for testing.
+  \item Rounding with integers: Equation~\eqref{eq:rne} and the three-case proof written out; the bf16 one-liner; why carry propagation is a feature. Code excerpt: the 6-line RNE.
+  \item Narrowing the exponent: the subnormal path, with a worked fp32$\to$E4M3 example on a real weight value (show the bits at each step).
+  \item Why E4M3 has no infinity: what the extra binade buys, what saturation costs; Fig.~3.
+  \item Integer quantization: the symmetric and asymmetric formulas, the $\Delta^2/12$ error, the $B+16/g$ storage; Fig.~5.
+  \item BFP is integer quantization with power-of-two scales: the encoding, the relative error bound $2^{(e_s-e_i)-m}$, Fig.~4, and why MLP matrices suffer more.
+  \item The compiler aside: 15 lines of \code{objdump} at \code{-O2}, what \code{-march=native} does, Fig.~6.
+  \item What went wrong: candidates from \code{docs/log.md}---the NaN that became infinity, the sign-extension of int4, the \code{-Wconversion} shift promotion.
+  \item What this predicts: KV-cache quantization (keys have outliers per channel; predict that per-channel scaling beats per-token for K and the reverse for V) and the BFP behaviour to expect on Tenstorrent hardware.
+  \item Reproduce box.
+\end{enumerate}
+
+\textbf{Code to show.} The RNE expression; the subnormal shift computation; the int4 unpack idiom; one \code{objdump} excerpt. Nothing else.
+
+\post{1b} \textbf{``Verifying a float converter against every one of the four billion inputs''}
+
+\textbf{Thesis.} Some functions have a small enough domain that testing \emph{is} proof; fp32$\to$fp16 is one, and the oracle is a CPU instruction. \textbf{Length} 1200--1500 words. \textbf{Figure:} wall time of the sweep vs threads (or vs \code{-O} level) and a table of mismatch counts per rounding mode and per bug you planted on purpose (round-half-up, missing subnormal shift, off-by-one overflow check) to show the sweep catches each. \textbf{Outline:} why exhaustive is possible here ($2^{32}$ inputs, $\sim$1 minute); building the oracle with \code{\_mm256\_cvtps\_ph}; the planted-bug table; what exhaustive testing cannot tell you (bf16 and fp8 have the same domain, but int quantization does not---property tests return); reproduce box. \textbf{What went wrong:} the first sweep ``passed'' because NaN payloads compared equal under \code{==} on bits but not on value---state which comparison you want.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} object model and the three trees (Section~\ref{sec:gitfund}); \code{.gitignore}; SSH keys; first remote; tags; commit messages.
+
+\textbf{Practice during this project.}
+\begin{enumerate}
+  \item After the skeleton commit, run \code{git cat-file -p} on the commit, the tree, and a blob. Edit one file, commit, and observe that only the changed blob, its tree path, and the commit are new objects (\code{find .git/objects -type f | wc -l} before and after).
+  \item Commit in small units: one commit for \code{ck.h}, one per format, one per test file, one for each benchmark. Use \code{git add -p} at least once to split an over-large edit.
+  \item When A1.2 closes: \code{git tag -a v0.1.0 -m "fp16/bf16 complete"} and \code{git push --follow-tags}. Annotated tags are objects with their own metadata; lightweight tags are just refs---use annotated for releases.
+  \item Write \code{.gitignore} \emph{before} the first build so that \code{build/} never enters history. If a generated file slips in: \code{git rm --cached <file>}, commit, and note that it still exists in older commits.
+  \item Keep \code{main} always building. You have no branches yet; project~2 introduces them.
+\end{enumerate}
+
+\textbf{Push checklist (every project):} \code{make fmt} $\to$ \code{make BUILD=asan test} $\to$ \code{make test} $\to$ \code{git status} shows only intended files $\to$ commit $\to$ \code{git push}. Update the README's headline number when it changes.
+\end{gitbox}

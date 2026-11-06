@@ -1,0 +1,278 @@
+\chapter{Project 3: \code{ltrace-ml} --- an interposition tracer and sampling profiler}
+\label{ch:p3}
+
+\section{Goal}
+
+A shared library, loaded with \code{LD\_PRELOAD}, that intercepts calls into other libraries---first \code{malloc}/\code{free}/\code{realloc}, then the CUDA runtime (\code{cudaMalloc}, \code{cudaMemcpyAsync}, \code{cudaLaunchKernel}, \ldots)---logging sizes, timings and call stacks with overhead low enough to run under a real PyTorch or vLLM workload; plus a \code{SIGPROF}-driven sampling profiler that emits flame-graph input. A small launcher (\code{fork}/\code{exec}) runs any program under the tracer. Symbolization is done offline by a Python post-processor from raw addresses and the process's memory map.
+
+\begin{hook}
+This becomes the measurement tool for your serving and compiler work: what does PyTorch actually ask the CUDA runtime for, how often, and from where? Which host-side code path burns the time between kernel launches? CUPTI and Nsight answer parts of this; building the poor man's version teaches the linker and signal machinery they stand on, and gives you a tool you can point at a WRF binary just as easily.
+\end{hook}
+
+\section{\csapp\ reading map}
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.40\textwidth}X@{}}
+\toprule
+Section & What you build with it \\
+\midrule
+\ch{7.4}--7.7 ELF, symbols, resolution, relocation & reading \code{readelf -r}, understanding which calls can be intercepted \\
+\ch{7.10}--7.12 dynamic linking, PIC, PLT/GOT, lazy binding & how \code{LD\_PRELOAD} wins symbol lookup; \code{dlsym(RTLD\_NEXT)} \\
+\ch{7.13} library interpositioning & the three interposition levels; \code{--wrap} variant \\
+\ch{8.2}--8.4 exceptions, processes, \code{fork}/\code{execve}/\code{waitpid} & the launcher; forked test runner for \code{ck.h} \\
+\ch{8.5} signals, blocking, async-signal safety & the sampling profiler \\
+\ch{8.6} nonlocal jumps & (read, not used; know why you avoid \code{longjmp} here) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Background}
+
+\subsection{Symbol resolution and why preloading works}
+
+At load time the dynamic linker builds a \emph{lookup scope}: the executable, then \code{LD\_PRELOAD} libraries in order, then \code{DT\_NEEDED} libraries breadth-first. An undefined symbol reference in any object is bound to the \emph{first} definition found in that order. A definition of \code{malloc} in your preloaded library therefore shadows glibc's for every caller that goes through the PLT---including calls from \emph{other} shared libraries (libtorch, libcudart). Calls that cannot be intercepted: (i) calls resolved at static link time (a statically linked \code{cudart}, which is \code{nvcc}'s default; check with \code{ldd} and \code{/proc/<pid>/maps}); (ii) internal calls within a library that bypass the PLT (glibc's internal \code{malloc} uses); (iii) symbols with protected visibility.
+
+\code{dlsym(RTLD\_NEXT, "malloc")} continues the search \emph{after} the calling library, returning glibc's definition---your ``real'' function. The bootstrapping hazard: \code{dlsym} may itself call \code{malloc} (it does, in some glibc versions, on first use), re-entering your hook before the real pointer is known. Standard solution: a thread-local reentrancy flag, and a small static bump allocator used only while the flag is set during initialization.
+
+\textbf{Link-time alternative.} \code{-Wl,--wrap=malloc} makes the linker resolve references to \code{malloc} to \code{\_\_wrap\_malloc} and references to \code{\_\_real\_malloc} to the original. It only affects objects linked with that flag---so it catches the program's own calls but not libtorch's. Build both variants and compare counts; the difference \emph{is} the lesson about linkage units.
+
+\textbf{Relocations you will see.} \code{readelf -r} on your tracer shows \code{R\_X86\_64\_JUMP\_SLOT} entries for each PLT target and \code{R\_X86\_64\_GLOB\_DAT} for data references through the GOT; the relocation formulas (\ch{7.7}) are $S+A$ for these and $S + A - P$ for PC-relative \code{R\_X86\_64\_PC32} references---the same arithmetic project~5 performs when it emits a RIP-relative load.
+
+\subsection{Capturing the caller}
+
+The cheapest caller identity is the return address: \code{\_\_builtin\_return\_address(0)}. Full stacks are walked through frame pointers: with \code{-fno-omit-frame-pointer}, every frame has \code{[rbp] = saved caller rbp} and \code{[rbp+8] = return address}, so the walk is
+\begin{lstlisting}[style=plain]
+fp = current rbp
+while fp != 0 and depth < MAX and fp is readable (within [rsp, stack_top)):
+    ra = *(fp + 8); emit ra; fp = *fp
+\end{lstlisting}
+Frames from code compiled without frame pointers (most distro libraries) break the chain; accept truncated stacks and document it, or fall back to \code{libunwind} (\code{unw\_backtrace}) as an optional backend. \code{backtrace()} from \code{<execinfo.h>} is \emph{not} usable inside a malloc hook or a signal handler: it may allocate on first use and is not async-signal-safe.
+
+\subsection{Offline symbolization}
+
+Log raw addresses. At exit, dump \code{/proc/self/maps} alongside the log. With address-space randomization, a code address $a$ inside a mapping with start $m$ and file offset $o$ corresponds to file virtual address $a - m + o$ (plus the segment's \code{p\_vaddr}$-$\code{p\_offset} adjustment, which \code{addr2line -e lib.so} and \code{nm} already expect---verify this on one symbol by hand). The Python post-processor resolves names with \code{addr2line}/\code{nm -C} and aggregates. Keeping symbolization off the hot path is what makes per-call tracing cheap.
+
+\subsection{Sampling profiler}
+
+\textbf{Mechanism.} \code{timer\_create(CLOCK\_PROCESS\_CPUTIME\_ID)} with \code{SIGEV\_SIGNAL} and signal \code{SIGPROF}, or \code{setitimer(ITIMER\_PROF)}, at frequency $f$. For per-thread attribution use one timer per thread with \code{SIGEV\_THREAD\_ID} (\code{sigev\_notify\_thread\_id}), created from a \code{pthread\_create} interposer. Install the handler with \code{sigaction}, flags \code{SA\_SIGINFO | SA\_RESTART}. The third handler argument is a \code{ucontext\_t*}: \code{uc\_mcontext.gregs[REG\_RIP]}, \code{[REG\_RBP]}, \code{[REG\_RSP]} give the interrupted program counter and frame, from which you walk the stack as above.
+
+\textbf{Async-signal safety.} Inside the handler: no \code{malloc}, no \code{printf}, no locks, no \code{errno}-clobbering without save/restore. Write samples to a per-thread preallocated ring buffer with a single-producer index; a flusher thread (or \code{atexit}) drains it with \code{write(2)}. The producer--consumer argument (\ch{12.5}) is simple here because each buffer has exactly one writer (the handler, which cannot interrupt itself if \code{SIGPROF} is blocked during delivery, which \code{sigaction} does by default).
+
+\textbf{Statistics.} Each sample is a Bernoulli trial for ``in function $g$'' with probability $p_g$ (fraction of CPU time). With $N = fT$ samples, $\hat p_g = n_g/N$ has standard error $\sqrt{p_g(1-p_g)/N}$. To estimate a function using $1\%$ of time to $\pm 20\%$ relative at 95\% confidence:
+\begin{equation}
+N \ge \left(\frac{1.96}{0.2}\right)^2 \frac{1-p_g}{p_g} \approx 9500 \text{ samples} \approx 10\text{ s at } 1\text{ kHz}.
+\end{equation}
+Print confidence intervals in the report; most profilers don't, and the absence is why people chase noise. \textbf{Overhead} is $f\cdot c$ for per-sample cost $c$; at $f = 1$~kHz and $c \approx 2\,\mu$s it is $0.2\%$. \textbf{Aliasing:} a workload with a periodic phase at frequency $f_p$ sampled at a commensurate $f$ sees the same phase every time; use a prime frequency (997~Hz) or jitter each interval by a random $\pm 10\%$.
+
+\textbf{Output format.} Folded stacks, one line per distinct stack: \code{main;cf\_forward;cf\_matvec\_avx2 1234} (frames root$\to$leaf separated by \code{;}, then the count). \code{flamegraph.pl} or \code{inferno-flamegraph} renders it.
+
+\subsection{Process control for the launcher (\ch{8.4})}
+
+\code{ltrace-ml run [opts] -- prog args}: \code{fork()}; in the child, set \code{LD\_PRELOAD} (prepend to any existing value), optionally \code{LTRACE\_OUT}, \code{LTRACE\_HZ}, then \code{execvp}; in the parent, forward \code{SIGINT}/\code{SIGTERM} to the child, \code{waitpid}, and exit with the child's status (\code{WEXITSTATUS}, or $128 + $ signal number if \code{WIFSIGNALED}). The tracer library flushes in an \code{atexit} handler and in a \code{SIGTERM} handler (only async-signal-safe calls).
+
+\subsection{What CUDA looks like from here}
+
+PyTorch's CUDA caching allocator requests large segments from \code{cudaMalloc} rarely and carves them itself, so a trace of a training step shows a burst of \code{cudaMalloc} at warm-up and then almost none---your tool makes this visible in one run. \code{cudaMemcpyAsync} sizes and directions (\code{cudaMemcpyKind}) expose the input pipeline; \code{cudaLaunchKernel} gives the launch rate and host-side gaps between launches (the symptom of CPU-bound serving). Kernel names are not available from the runtime API without CUPTI, but the function pointer argument can be symbolized offline against the fatbinary's host stubs---often enough to identify the operator. Interpose the \emph{driver} API (\code{cuLaunchKernel}) as well if the runtime is statically linked but \code{libcuda.so} is not (it never is).
+
+\section{Architecture}
+
+\subsection{Directory layout}
+
+\begin{lstlisting}[style=plain]
+ltrace-ml/
+  include/ltrace/
+    hooks.h        interposer registration macros; LT_HOOK(name, ret, args...)
+    log.h          per-thread ring buffer, event records, flush
+    stack.h        frame-pointer walker, optional libunwind backend
+    prof.h         sampling profiler: start/stop, per-thread timers
+    maps.h         /proc/self/maps snapshot
+  src/
+    hooks_malloc.c hooks_pthread.c hooks_cuda.c (dlopen-free: plain symbol definitions)
+    log.c stack.c prof.c maps.c init.c (constructor: read env, set up buffers)
+    launcher/main.c (ltrace-ml run ... ; ltrace-ml report ...)
+  tools/
+    symbolize.py   raw log + maps -> symbolized events / folded stacks / summary tables
+  tests/
+    targets/       small programs with known behaviour (alloc_counter.c, cpu_shares.c, threads.c)
+    test_hooks.c test_stack.c test_prof.c test_launcher.c
+  bench/           overhead.c (traced vs untraced malloc-heavy loop; profiler overhead vs Hz)
+\end{lstlisting}
+
+\subsection{Public API and formats}
+
+\begin{lstlisting}[style=c]
+/* log.h -- fixed-size binary records, little-endian, written with write(2) */
+typedef struct {
+  uint64_t ts_ns;        /* CLOCK_MONOTONIC */
+  uint32_t tid;
+  uint16_t kind;         /* LT_MALLOC, LT_FREE, LT_REALLOC, LT_CUDA_MALLOC, LT_CUDA_MEMCPY, LT_LAUNCH, LT_SAMPLE ... */
+  uint16_t nframes;      /* number of return addresses following the record */
+  uint64_t a0, a1, a2;   /* kind-specific: size, ptr, direction, device ptr, ... */
+  /* followed by nframes * uint64_t */
+} lt_event;
+
+typedef struct lt_ring lt_ring;                /* SPSC ring, power-of-two size, per thread */
+lt_ring *lt_ring_get(void);                    /* thread-local, lazily created with the bump allocator */
+int  lt_ring_push(lt_ring *r, const lt_event *e, const uint64_t *frames);   /* async-signal-safe */
+void lt_flush_all(void);                       /* called at exit / SIGTERM */
+
+/* stack.h */
+int lt_walk_fp(void *rbp, void *rsp, uint64_t *out, int max);          /* returns frames written */
+
+/* prof.h */
+int  lt_prof_start(unsigned hz, bool per_thread);
+void lt_prof_stop(void);
+
+/* hooks.h -- example of the pattern each hook follows */
+#define LT_REAL(name) (lt_real_##name ? lt_real_##name : lt_resolve_##name())
+void *malloc(size_t n);  /* implemented as: guard; t0; p = LT_REAL(malloc)(n); log; return p */
+\end{lstlisting}
+
+Environment variables:
+\begin{lstlisting}[style=plain]
+LTRACE_OUT=<dir>         default ./ltrace.<pid>/
+LTRACE_HOOKS=malloc,cuda,pthread
+LTRACE_HZ=997            profiler frequency; 0 disables
+LTRACE_STACKS=0|fp|unwind
+LTRACE_MAXDEPTH=32
+LTRACE_RING_MB=16        per-thread ring size
+\end{lstlisting}
+
+Output directory: \code{events.bin} (records), \code{maps.txt} (\code{/proc/self/maps} at exit), \code{meta.json} (hz, start time, argv). \code{tools/symbolize.py} produces \code{events.tsv}, \code{alloc\_summary.md} (counts/bytes by call site, live-at-exit), \code{cuda\_summary.md}, and \code{profile.folded}.
+
+\subsection{Hook pattern (pseudocode)}
+
+\begin{lstlisting}[style=plain]
+thread_local int in_hook = 0
+
+malloc(n):
+    if in_hook or !initialized:  return bump_alloc(n)      # bootstrap / reentrancy
+    in_hook = 1
+    real = LT_REAL(malloc)                                   # dlsym(RTLD_NEXT) once, cached
+    t0 = now(); p = real(n); dt = now() - t0
+    frames = walk_fp(__builtin_frame_address(0), ...) if stacks enabled
+    ring_push({ts=t0, kind=MALLOC, a0=n, a1=p, a2=dt}, frames)
+    in_hook = 0
+    return p
+
+free(p):
+    if p is inside the bump arena: return                    # never hand bump memory to glibc
+    ... same shape ...
+\end{lstlisting}
+
+\section{Assignments}
+
+\assignment{A3.1}{Allocation hooks and the launcher}{10 h}
+\textbf{Goal.} \code{ltrace-ml run -- prog} produces a by-call-site allocation table for any dynamically linked program.\\
+\textbf{Steps.} (1) \code{init.c}: a constructor that reads the environment, allocates per-thread rings from a static bump arena, opens the output directory, registers \code{atexit}. (2) \code{hooks\_malloc.c} following the hook pattern: \code{malloc}, \code{free}, \code{calloc}, \code{realloc}, \code{posix\_memalign}, \code{aligned\_alloc}; return address only. (3) \code{log.c}: the SPSC ring and \code{lt\_flush\_all} using only \code{write(2)}. (4) \code{maps.c}: copy \code{/proc/self/maps} at exit. (5) The launcher: \code{fork}/\code{execvp}, \code{LD\_PRELOAD} prepending, status propagation, signal forwarding. (6) \code{tools/symbolize.py}: parse records, resolve return addresses via \code{addr2line} per mapping, aggregate count/bytes/live by site. (7) Trace \code{cforward} decoding 100 tokens and read the table.\\
+\textbf{Acceptance.} \code{alloc\_counter} test exact; reentrancy test passes; launcher status tests pass; the \code{cforward} table identifies the tokenizer's per-token allocations (and you fix them in \code{cforward}---note the commit).\\
+\textbf{Feeds.} Post~3 sections 4--6 (lookup scope, bootstrapping, offline symbolization).
+
+\assignment{A3.2}{Stack walking and the two interposition levels}{8 h}
+\textbf{Goal.} Call stacks on every event; a measured comparison of \code{LD\_PRELOAD} vs \code{--wrap}.\\
+\textbf{Steps.} (1) \code{stack.c}: frame-pointer walk bounded by the thread's stack limits (\code{pthread\_getattr\_np}); depth limit. (2) Folded-stack output from \code{symbolize.py}; render one flame graph of \code{cforward}'s allocations. (3) \code{--wrap} build variant of the same hooks (\code{\_\_wrap\_malloc}/\code{\_\_real\_malloc}); the four-target interposition matrix test. (4) \code{readelf -r} walkthrough in \code{docs/linking-notes.md}: find the \code{JUMP\_SLOT} for \code{malloc} in \code{cforward}, in \code{libc}, in your tracer.\\
+\textbf{Acceptance.} Stack test passes (known chain resolved in order); truncated chains do not crash; the matrix test encodes which of the four cases are intercepted and passes; the notes file explains each row by the lookup-scope rule.\\
+\textbf{Feeds.} Post~3 the \code{readelf -r} figure and the ``what cannot be intercepted'' section.
+
+\assignment{A3.3}{Sampling profiler, single-threaded}{10 h}
+\textbf{Goal.} A \code{SIGPROF} profiler with confidence intervals and flame-graph output.\\
+\textbf{Steps.} (1) \code{prof.c}: \code{timer\_create} at \code{LTRACE\_HZ}; \code{sigaction} handler with \code{SA\_SIGINFO|SA\_RESTART}; read \code{REG\_RIP}/\code{REG\_RBP} from the \code{ucontext}; walk; push a sample record. (2) Audit the handler for async-signal safety (list every call in a comment). (3) \code{cpu\_shares.c} target with calibrated 70/20/10 work; the accuracy test with intervals. (4) \code{symbolize.py --profile}: folded stacks with counts and a summary table with $\hat{p}$ and 95\% intervals per function. (5) Jittered intervals; a test target with a periodic 100~Hz phase to show aliasing at 100~Hz sampling and its absence at 997~Hz jittered.\\
+\textbf{Acceptance.} Accuracy test passes; aliasing demonstration recorded in \code{docs/log.md} with numbers; a flame graph of \code{cforward} decode shows \code{matvec} dominating with the expected share.\\
+\textbf{Feeds.} Post~3 section 7; all of Post~3b.
+
+\assignment{A3.4}{Threads}{8 h}
+\textbf{Goal.} Per-thread attribution and a TSan-clean tracer under a multithreaded target.\\
+\textbf{Steps.} (1) \code{hooks\_pthread.c}: interpose \code{pthread\_create} to wrap the start routine (create the thread's ring and timer on entry, flush on exit via a \code{pthread\_key} destructor). (2) Per-thread \code{SIGEV\_THREAD\_ID} timers. (3) Ring overflow counters reported at exit. (4) Stress test (8 threads, 10~kHz, 30~s) under TSan; the OpenMP build of \code{cforward} traced and profiled per thread.\\
+\textbf{Acceptance.} Stress test passes under TSan with zero reports; per-thread profile of OpenMP \code{cforward} shows the expected symmetric shares and the serial sections on thread 0.\\
+\textbf{Feeds.} Post~3 results (the per-thread profile) and Post~6's profiling of the server.
+
+\assignment{A3.5}{CUDA runtime interposition}{10 h}
+\textbf{Goal.} A trace of what a PyTorch step asks of \code{libcudart}.\\
+\textbf{Steps.} (1) Declare the needed prototypes yourself in \code{hooks\_cuda.c} (no CUDA headers at build time): \code{cudaMalloc}, \code{cudaFree}, \code{cudaMemcpy}, \code{cudaMemcpyAsync}, \code{cudaLaunchKernel}, \code{cudaStreamSynchronize}, \code{cudaDeviceSynchronize}; resolve with \code{RTLD\_NEXT}. (2) Record sizes, kinds, stream ids, function pointers, timestamps. (3) Verify with \code{ldd}/\code{/proc/<pid>/maps} that the target's \code{cudart} is dynamic. (4) Run: \code{python -c} doing a forward/backward of a small model; then a HF \code{generate} loop; then (optional) vLLM for 50 requests. (5) \code{symbolize.py --cuda}: timeline of \code{cudaMalloc} bytes, memcpy bytes by direction over time, launch rate over time with inter-launch gaps histogram.\\
+\textbf{Acceptance.} The timeline shows the caching allocator's warm-up burst and near-zero \code{cudaMalloc} afterwards; launch-rate plot exists; \code{docs/cuda-notes.md} records what could not be intercepted and why.\\
+\textbf{Feeds.} Post~3 central figure and the PyTorch section.
+
+\assignment{A3.6}{Overhead study}{5 h}
+\textbf{Goal.} Numbers for the cost of the tool.\\
+\textbf{Steps.} (1) \code{bench/overhead.c}: malloc-heavy loop ($10^7$ allocations of mixed sizes) untraced, traced without stacks, traced with stacks; profiler at 100, 1000, 10000~Hz on \code{cforward}. (2) Report slowdown factors and, for the profiler, measured overhead vs the $f\cdot c$ model.\\
+\textbf{Acceptance.} Table in README; profiler overhead at 997~Hz below 1\%; stacks cost documented.\\
+\textbf{Feeds.} Post~3 results; Post~3b overhead paragraph.
+
+\assignment{A3.7}{Stretch: a WRF binary}{4 h}
+\textbf{Goal.} Point the profiler at a WRF-Fire run from the compiler study and compare host-side profiles across two compiler builds.\\
+\textbf{Acceptance.} Two flame graphs and a one-paragraph comparison in \code{docs/log.md}.\\
+\textbf{Feeds.} A paragraph in Post~3's ``what this predicts elsewhere''.
+
+\section{Test plan}
+
+\begin{description}
+  \item[Exact counts] \code{tests/targets/alloc\_counter.c} performs exactly $N$ mallocs of known sizes after printing a marker; the test runs it under the tracer and checks the count and byte total of events after the marker (libc's own startup allocations happen before). Also: every \code{free} matches a logged \code{malloc}; live-at-exit equals the planted leak.
+  \item[Reentrancy] A hook configured to call \code{printf} (deliberately, in a test build) must neither recurse infinitely nor deadlock; bump-arena pointers passed to \code{free} are ignored.
+  \item[Stack walker] A target with a known call chain \code{a->b->c->malloc} compiled with frame pointers yields those return addresses in order (resolve offline and compare names); a frame-pointer-less frame truncates cleanly rather than crashing (guard reads against the stack bounds from \code{pthread\_getattr\_np}).
+  \item[Profiler accuracy] \code{cpu\_shares.c} spends 70/20/10\% of time in three functions, calibrated by work units; at 997~Hz for 10~s the estimates fall within the computed 95\% intervals in 19 of 20 runs (run 20 times in \code{bench/}, 1 time in tests with a wide tolerance).
+  \item[Signal safety] Run the profiler at 10~kHz under a target that calls \code{malloc} in a tight loop for 30~s with 8 threads: no deadlock, no crash, ring overflow counted and reported, never silently dropped. Run under TSan.
+  \item[Launcher] Exit status propagation (0, 3, killed by \code{SIGSEGV} $\Rightarrow 139$); \code{SIGINT} forwarded; existing \code{LD\_PRELOAD} preserved.
+  \item[Symbolizer] Round trip: known function addresses in a PIE binary at two different ASLR layouts resolve to the same names.
+  \item[Interposition matrix] Table of (static, dynamic) $\times$ (PRELOAD, --wrap): which calls are seen. Encode it as a test with four tiny targets.
+\end{description}
+
+\section{Measurements and blog briefs}
+
+(i) Allocation histogram by size and by call site for \code{cforward} and for a PyTorch forward pass; (ii) \code{cudaMalloc} timeline showing the caching allocator's warm-up; (iii) \code{cudaMemcpy} bytes by direction; (iv) launch rate vs time with host gaps; (v) profiler overhead vs frequency; (vi) estimated fractions with confidence intervals vs ground truth; (vii) the interposition matrix.
+
+\begin{blogbox}
+\post{3} \textbf{``What does PyTorch actually ask the CUDA runtime for? 400 lines of \code{LD\_PRELOAD} later''}
+
+\textbf{Audience and thesis.} For people who profile with Nsight or \code{torch.profiler} and have never looked underneath. Thesis: dynamic linking is an API you can program against; a preloaded library plus offline symbolization gives you most of a tracer at almost no overhead, and what it shows about a real framework is not what the documentation suggests. Subtitle: ``$N$ \code{cudaMalloc} calls in the first second, $M$ in the next minute''.
+
+\textbf{Length.} 2500--3000 words.
+
+\textbf{Figures.}
+\begin{enumerate}
+  \item \fig{1} (central) Timeline of a PyTorch training step loop: \code{cudaMalloc} bytes (bars) and kernel-launch rate (line) over time, warm-up burst visible, with the steady state annotated.
+  \item \fig{2} Lookup-scope diagram: executable $\to$ \code{LD\_PRELOAD} libs $\to$ \code{DT\_NEEDED} breadth-first, with the arrow showing where \code{malloc} resolves with and without the preload.
+  \item \fig{3} \code{readelf -r} excerpt (as a code figure) of the \code{JUMP\_SLOT} relocation for \code{malloc} in \code{cforward}, next to the \code{objdump} of the PLT stub.
+  \item \fig{4} \code{cudaMemcpy} bytes by direction per step; inter-launch gap histogram (log $x$).
+  \item \fig{5} Interposition matrix as a $2\times 2$ table with check marks.
+  \item \fig{6} Overhead: slowdown vs mode (no stacks, stacks) and profiler overhead vs frequency with the $f\cdot c$ line.
+\end{enumerate}
+
+\textbf{Outline.}
+\begin{enumerate}
+  \item Lede: the question, the tool, the headline count.
+  \item Fig.~1 and the caching-allocator explanation in two sentences.
+  \item Setup: framework version, model, GPU, tag; how \code{cudart} was confirmed dynamic.
+  \item Symbol lookup scope (Fig.~2) and the \csapp\ rule; \code{RTLD\_NEXT}; Fig.~3.
+  \item The bootstrapping problem: why \code{dlsym} may call \code{malloc}, the thread-local guard and the bump arena, in 15 lines of code.
+  \item Why symbolize offline: ASLR arithmetic ($a - m + o$), the \code{maps} snapshot, and the cost you avoid on the hot path.
+  \item The sampling profiler in one section: the \code{ucontext} registers, the frame-pointer walk (code excerpt), and the one rule of async-signal safety; the accuracy test with intervals (a small table).
+  \item What the traces show about PyTorch: Fig.~1 again in detail, Fig.~4, the H2D pattern of the input pipeline, launch gaps as the symptom of CPU-bound serving.
+  \item What cannot be intercepted (Fig.~5): static \code{cudart}, internal PLT bypass, protected visibility; the \code{--wrap} comparison numbers.
+  \item Overhead (Fig.~6).
+  \item What went wrong: the infinite recursion on first \code{dlsym}; \code{backtrace()} allocating inside a hook; the \code{free} of a bump-arena pointer handed to glibc.
+  \item What this predicts: the same technique on \code{libtt\_metal} or any accelerator runtime; what a CUPTI-free profiler can and cannot see; one prediction about launch-gap distribution under vLLM.
+  \item Reproduce box.
+\end{enumerate}
+
+\textbf{Code to show.} The hook pattern (with guard); the frame-pointer walk; the \code{sigaction} setup; one \code{readelf} excerpt.
+
+\post{3b} \textbf{``A sampling profiler is a statistics problem''}
+
+\textbf{Thesis.} A profile is an estimate with an error bar, and the three decisions---sample count, sampling frequency, jitter---are statistical decisions most tools make silently. \textbf{Length} 1200--1500 words. \textbf{Figures:} estimated vs true fraction for the 70/20/10 target with 95\% intervals at $N = 10^2, 10^3, 10^4$; the aliasing demonstration (a 100~Hz periodic phase sampled at 100~Hz vs 997~Hz jittered). \textbf{Outline:} the Bernoulli model and the interval formula with the ``1\% to $\pm 20\%$ needs 9500 samples'' example; overhead as $f\cdot c$ and the measured $c$; aliasing and the prime/jitter fix; what the profiler cannot attribute (frames without frame pointers, time in the kernel); reproduce box. \textbf{What went wrong:} the first accuracy test failed because the work loop was optimized away at \code{-O2}---how to calibrate work units so the compiler cannot remove them.
+\end{blogbox}
+
+\section{Git lesson and push checklist}
+
+\begin{gitbox}
+\textbf{Topics:} history archaeology (\code{log -S}, \code{log -G}, \code{blame}); the reflog as a safety net; worktrees; versioned hooks; \code{.gitattributes}.
+
+\textbf{Practice.}
+\begin{enumerate}
+  \item \code{git log -S'RTLD\_NEXT' --oneline} finds the commit that introduced a string; \code{-G<regex>} matches diff lines; \code{git blame -w -C -C src/hooks\_malloc.c} follows moved code. Use them to write the ``history'' section of \code{docs/design.md}.
+  \item Break something on purpose: \code{git reset --hard HEAD\~{}3}, then recover with \code{git reflog} and \code{git reset --hard HEAD@\{1\}}. Understand that the reflog is local and expires (90 days by default); unreachable objects are deleted by \code{gc}.
+  \item \code{git worktree add ../ltrace-wrap wrap-variant} to build the \code{--wrap} variant side by side with the PRELOAD one without stashing or switching. \code{git worktree list}, \code{remove}.
+  \item Version your hooks: put \code{pre-commit} (runs \code{make fmt} check and \code{make BUILD=asan test}) in \code{.githooks/} and set \code{git config core.hooksPath .githooks}; document it in the README. A hook that is too slow gets bypassed with \code{--no-verify}, so keep it under 30~s.
+  \item \code{.gitattributes}: \code{*.bin binary}, \code{tools/* linguist-language=Python}, \code{* text=auto eol=lf}.
+  \item Tag \code{v0.3.0} at A3.5.
+\end{enumerate}
+\end{gitbox}

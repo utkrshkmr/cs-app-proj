@@ -1,0 +1,331 @@
+\chapter{Shared infrastructure}
+\label{ch:infra}
+
+Everything in this chapter is set up once, in project~1, and reused by the other five. Do it properly the first time: a solid test harness and build system is what makes the later projects' measurements trustworthy.
+
+\section{Toolchain}
+
+\begin{itemize}
+  \item \textbf{Compilers.} GCC~12+ and Clang~16+, both installed; every project must build with both (the differences are themselves data for you). C projects use \code{-std=c17}; project~6 uses \code{-std=c++20}.
+  \item \textbf{Warning flags, always on:} \code{-Wall -Wextra -Wpedantic -Wshadow} \code{-Wconversion} \code{-Wstrict-prototypes -Werror}. Fixing \code{-Wconversion} warnings in a numerics library will teach you more about \csapp\ chapter~2 than the exercises will.
+  \item \textbf{Build variants} (selected by \code{BUILD=}): \code{debug} (\code{-O0 -g3}), \code{release} (\code{-O2 -g} \code{-fno-omit-frame-pointer} \code{-march=native}), \code{asan} (\code{-O1 -g} \code{-fsanitize=address,undefined}), \code{tsan} (\code{-O1 -g} \code{-fsanitize=thread}). Keep frame pointers in release builds: project~3's stack walker depends on them, and the cost is negligible.
+  \item \textbf{Tools you will use constantly:} \code{perf} (with \code{kernel.perf\_event\_paranoid} $\le 1$), \code{valgrind} (\code{--tool=memcheck}, \code{--tool=cachegrind}), \code{objdump -d -M intel}, \code{readelf -a}, \code{nm -C}, \code{ldd}, \code{strace}, \code{gdb}, \code{clang-format}, \code{python3} with \code{numpy} and \code{torch} for reference values.
+  \item \textbf{Hardware notes.} Record once, in \code{docs/machine.md}: CPU model, core count, base/turbo frequency, L1d/L2/L3 sizes (\code{lscpu}, \code{getconf -a | grep CACHE}), DRAM type and channel count, measured STREAM bandwidth, measured peak FP32 FLOP/s (project~2 gives you the microbenchmarks). Every performance number you publish refers back to this file.
+\end{itemize}
+
+\section{The C toolchain, concept by concept}
+\label{sec:ctools}
+
+You know C++ and CUDA, so this section is not about the language. It is about the \emph{tools around} a C program---what each one does to your bytes, in the order they do it---because the projects lean on them constantly and \csapp\ chapter~7 assumes you already have the vocabulary.
+
+\subsection{What \code{gcc foo.c} actually runs}
+
+The compiler driver runs four programs in sequence, and you can stop after any of them:
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lllX@{}}
+\toprule
+Stage & Program & Stop with & What it does \\
+\midrule
+Preprocess & \code{cpp} & \code{-E} $\to$ \code{foo.i} & Textual: \code{\#include} pastes headers in, \code{\#define} substitutes, \code{\#if} selects. No types, no semantics. \\
+Compile & \code{cc1} & \code{-S} $\to$ \code{foo.s} & C to assembly for one \emph{translation unit} (the \code{.i} file). All optimization happens here. \\
+Assemble & \code{as} & \code{-c} $\to$ \code{foo.o} & Assembly to a \emph{relocatable object}: machine code plus a symbol table plus relocation records for addresses it does not know yet. \\
+Link & \code{ld} (via \code{collect2}) & (default) $\to$ \code{a.out} & Merges objects and libraries, resolves symbols, applies relocations, lays out segments. Chapter~7 is about this stage. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Run \code{gcc -v foo.c} once to see the four commands with their real flags. Run \code{gcc -E} on a file that includes \code{<stdio.h>} and look at how many lines come out; that is why header hygiene matters. Run \code{gcc -S -O2 -fverbose-asm} and read the output next to \code{objdump -d} of the \code{.o}: the first is what the compiler meant, the second is what the assembler produced, and the addresses in the second are all zero-based because relocation has not happened yet.
+
+\textbf{Translation units and headers.} A \code{.c} file plus everything it includes is one translation unit, compiled in isolation. A header is a \emph{promise} about things defined elsewhere (function prototypes, \code{extern} variables, types, macros); the definition lives in exactly one \code{.c} file. \code{static} at file scope makes a symbol invisible to other units (internal linkage); without it, the symbol is global and the linker will complain if two units define it. Include guards (\code{\#ifndef FOO\_H}) or \code{\#pragma once} prevent double inclusion within one unit. Your \code{include/<project>/} directory holds the public promises; \code{src/} holds the definitions and may have private headers of its own.
+
+\textbf{Flags you will type a thousand times.} \code{-I dir} adds an include search directory; \code{-D NAME=val} defines a macro from the command line (how \code{-DTJ\_VERSION} works in project~5); \code{-O0/-O1/-O2/-O3/-Os} set optimization level (\code{-O2} is the measurement default; \code{-O3} adds aggressive vectorization and inlining that sometimes helps and sometimes hurts---measure); \code{-g} embeds DWARF debug information (does not slow code down; always keep it); \code{-march=native} lets the compiler use every instruction your CPU has (AVX2, FMA) and makes the binary non-portable; \code{-fno-omit-frame-pointer} keeps \code{rbp} as a frame pointer so stack walkers work; \code{-fPIC} generates position-independent code, required for shared libraries; \code{-std=c17} and \code{-pedantic} pin the language; \code{-Wall -Wextra} and friends turn on diagnostics that the standard does not require but that catch real bugs; \code{-Werror} makes them fatal so they cannot accumulate.
+
+\textbf{What \code{-O2} does to your code.} Inlining (small functions disappear), constant propagation and dead-code elimination (your benchmark loop may vanish if its result is unused---use \code{volatile} sinks or \code{asm volatile("" :: "r"(x))} barriers), loop-invariant code motion, strength reduction, register allocation (locals never touch memory), and auto-vectorization when it can prove there is no aliasing. \csapp\ chapter~5 is largely about what stops the optimizer: memory aliasing (two pointers might point at the same place, so stores cannot be reordered), function calls (might have side effects), and floating-point reassociation (not allowed without \code{-ffast-math}). \code{restrict} on pointer parameters promises no aliasing and is often the difference between a vectorized loop and a scalar one.
+
+\subsection{Make, properly}
+
+\code{make} is a dependency engine: given rules of the form \emph{target: prerequisites, recipe}, it rebuilds a target when any prerequisite is newer than it (by file modification time), recursively. Everything else is convenience syntax.
+
+\begin{lstlisting}[style=plain]
+target: prereq1 prereq2        # a rule
+	recipe-command               # recipes are indented with a TAB, not spaces
+\end{lstlisting}
+
+\textbf{Variables.} \code{CC = gcc} (recursively expanded: evaluated when used) vs \code{CC := gcc} (simply expanded: evaluated now); \code{CC ?= gcc} sets only if unset (lets \code{make CC=clang} override from the command line); \code{CFLAGS += -g} appends. Conventional names matter because the built-in rules use them: \code{CC}, \code{CFLAGS}, \code{CPPFLAGS} (preprocessor: \code{-I}, \code{-D}), \code{LDFLAGS} (linker: \code{-L}), \code{LDLIBS} (libraries: \code{-lm}).
+
+\textbf{Pattern rules and automatic variables.} \code{\$(OUT)/\%.o: src/\%.c} says ``any \code{.o} in \code{build/} is made from the same-stem \code{.c} in \code{src/}''. Inside a recipe: \code{\$@} is the target, \code{\$<} the first prerequisite, \code{\$\^{}} all prerequisites, \code{\$*} the stem matched by \code{\%}. \code{\$(wildcard src/*.c)} lists files; \code{\$(SRC:src/\%.c=\$(OUT)/\%.o)} rewrites a list by pattern (substitution reference); \code{\$(patsubst ...)}, \code{\$(filter ...)}, \code{\$(shell ...)} are the other functions you will need.
+
+\textbf{Order-only prerequisites.} \code{\$(OUT)/\%.o: src/\%.c | \$(OUT)} means the directory must exist before the recipe runs but its timestamp does not trigger rebuilds (directories change mtime whenever a file inside them does, which would otherwise rebuild everything every time).
+
+\textbf{Phony targets.} \code{.PHONY: all test clean fmt} declares names that are not files, so \code{make clean} runs even if a file named \code{clean} exists and is never considered up to date.
+
+\textbf{Header dependencies.} Make does not parse C, so by default editing a header rebuilds nothing. \code{-MMD -MP} makes the compiler write \code{foo.d} alongside \code{foo.o} containing \code{foo.o: foo.c a.h b.h} (plus empty rules for each header so deleting one does not break the build); \code{-include \$(OBJ:.o=.d)} pulls those in. This is the single most common cause of ``it works after \code{make clean}''.
+
+\textbf{Conditionals and variants.} \code{ifeq (\$(BUILD),asan) ... else ... endif} selects flags; because \code{OUT} includes \code{\$(BUILD)}, the variants have separate object directories and never contaminate each other.
+
+\textbf{Running it.} \code{make -j\$(nproc)} builds in parallel (your rules must declare true dependencies for this to be safe); \code{make -n} prints the commands without running them; \code{make -B} forces a rebuild; \code{make --debug=b} explains why each target is rebuilt; \code{make -p} dumps the database of rules including the built-in ones (read it once).
+
+\textbf{Why not CMake?} CMake generates Makefiles (or Ninja files) from a higher-level description and handles cross-platform and multi-configuration builds well; for six single-platform libraries with a dozen files each, a hand-written Makefile is shorter, teaches more, and has no generator step. Project~6 may adopt CMake when the submodules make the Makefile awkward; by then you will know what it is generating.
+
+\subsection{Objects, archives, shared libraries, and the linker}
+
+\textbf{Relocatable object (\code{.o}).} Sections (\code{.text} code, \code{.data} initialized globals, \code{.bss} zero-initialized globals that occupy no file space, \code{.rodata} constants, \code{.symtab}, \code{.rela.text} relocations, DWARF \code{.debug\_*}); \code{readelf -S} lists them, \code{nm} lists symbols with a letter (\code{T} defined in text, \code{U} undefined, \code{D} data, \code{t} local text, \code{W} weak), \code{objdump -d} disassembles, \code{objdump -r} shows relocations.
+
+\textbf{Static library (\code{.a}).} An \code{ar} archive of \code{.o} files with an index; \code{ar rcs lib.a *.o}. The linker pulls out only the members that resolve currently-undefined symbols, \emph{in command-line order}, which is why \code{-lfoo} must come \emph{after} the objects that use it and why circular dependencies between archives need the library listed twice. \code{libqnum.a} linked into \code{cforward} means \code{cforward}'s binary contains a copy of the code it used, and nothing else.
+
+\textbf{Shared library (\code{.so}).} Built from \code{-fPIC} objects with \code{gcc -shared -o libfoo.so}; code is not copied into the executable but mapped at run time by the dynamic linker (\code{ld-linux.so}), which resolves \code{DT\_NEEDED} entries by searching \code{LD\_LIBRARY\_PATH}, the executable's \code{RUNPATH} (\code{-Wl,-rpath,\$ORIGIN/../lib}), and the system cache (\code{ldconfig}). \code{ldd prog} shows what it will load; \code{LD\_DEBUG=libs ./prog} shows the search. Functions are called through the PLT/GOT indirection (\ch{7.12}), lazily bound on first call unless \code{LD\_BIND\_NOW} is set; \code{LD\_PRELOAD} is project~3's whole premise. Versioned names (\code{libfoo.so.1.2.3} $\leftarrow$ \code{libfoo.so.1} $\leftarrow$ \code{libfoo.so}) exist so that a program linked against ABI version 1 keeps working after an upgrade; you will not need them, but you will see them in \code{ldd} output.
+
+\textbf{Symbol resolution rules} (\ch{7.6}). Strong symbols (functions, initialized globals) may be defined once; weak symbols (uninitialized globals, \code{\_\_attribute\_\_((weak))}) yield to a strong one; two strong definitions are an error; two weak ones pick arbitrarily (compile with \code{-fno-common} to avoid the surprises). \code{-Wl,--wrap=sym}, \code{-Wl,-Map=out.map} (a full layout listing), \code{-Wl,--gc-sections} with \code{-ffunction-sections} (drop unused functions) are the linker flags worth knowing; \code{-Wl,} passes what follows to \code{ld}.
+
+\textbf{Executables.} \code{readelf -l} shows program headers (segments: what the loader maps, with permissions); \code{readelf -h} the entry point; a PIE (position-independent executable, the default now) is itself relocated at load time to a random base (ASLR), which is why project~3 subtracts the load base before symbolizing.
+
+\subsection{Debuggers, sanitizers, and analyzers}
+
+\textbf{gdb.} \code{gdb --args ./prog arg}; \code{break file.c:123}, \code{run}, \code{next}/\code{step}/\code{finish}, \code{print expr} (and \code{print/x}, \code{print *ptr@8} for arrays), \code{backtrace} (\code{bt}), \code{frame 2}, \code{info registers}, \code{x/8xg \$rsp} (examine memory), \code{watch var} (hardware watchpoint; stops when it changes), \code{display var}, \code{layout asm}/\code{layout src} (TUI). For a crash: \code{ulimit -c unlimited}, then \code{gdb ./prog core}. Reverse execution (\code{record}, \code{reverse-next}) is slow but occasionally the only way to answer ``who wrote this value?''. Build with \code{-g -O0} to debug logic, \code{-g -O2} to debug what you ship (variables may be ``optimized out''---that is real, not a bug).
+
+\textbf{Sanitizers} are compiler instrumentation plus a runtime, enabled per build: AddressSanitizer (\code{-fsanitize=address}: heap/stack/global overflows, use-after-free, leaks; $\sim 2\times$ slowdown, $2$--$3\times$ memory), UndefinedBehaviorSanitizer (\code{-fsanitize=undefined}: signed overflow, misaligned access, shift out of range, null dereference---cheap, always combine with ASan), ThreadSanitizer (\code{-fsanitize=thread}: data races and some deadlocks; $5$--$15\times$ slowdown; incompatible with ASan in the same binary), MemorySanitizer (clang only: uninitialized reads). Sanitizers cannot see inside memory you manage yourself (project~4's allocator), which is why that project has a shadow checker, and ASan's own allocator replaces \code{malloc}, which matters for project~3 (test the tracer in non-ASan builds too). \code{ASAN\_OPTIONS=detect\_leaks=1:abort\_on\_error=1} and \code{TSAN\_OPTIONS=halt\_on\_error=1} are the environment knobs you will use.
+
+\textbf{Valgrind} is binary instrumentation, no rebuild needed, $20$--$50\times$ slower: \code{memcheck} (default) finds uninitialized reads and invalid accesses, including in code you did not compile; \code{cachegrind} simulates the cache hierarchy and gives per-line miss counts (\code{cg\_annotate}); \code{callgrind} gives call-graph profiles (\code{kcachegrind} to view); \code{massif} profiles heap usage over time; \code{helgrind} and \code{drd} find races (slower than TSan, different blind spots). Use memcheck on every project once; cachegrind in project~2; massif if an allocator question arises in project~4.
+
+\textbf{perf} reads hardware counters and samples (Appendix~\ref{app:perf}); \code{strace -f -e trace=mmap,openat ./prog} shows system calls (what project~3's tracer sees from the other side; use it to confirm \code{mmap} sizes in projects~2 and 4); \code{ltrace} is the library-call analogue (and the name your project~3 tool nods to).
+
+\textbf{Static analysis and formatting.} \code{clang-tidy} with a modest check set (\code{bugprone-*}, \code{performance-*}, \code{readability-*}) catches a class of mistakes before running anything; \code{cppcheck} is a second opinion; \code{scan-build make} runs clang's static analyzer over the whole build. \code{clang-format} with a committed \code{.clang-format} ends formatting discussions; \code{make fmt} runs it, and the pre-commit hook from project~3 checks it.
+
+\textbf{Inspecting binaries, a habit to build.} After every optimization in project~2, \code{objdump -d -M intel --no-show-raw-insn build/release/kernels.o | less} and find your loop. After every linking question in project~3, \code{readelf -r}, \code{nm -D} (dynamic symbols), \code{readelf -d} (dynamic section: \code{NEEDED}, \code{RUNPATH}). After writing bytes in project~5, \code{objdump -D -b binary -m i386:x86-64}. \code{size prog} for section sizes, \code{strings}, \code{file}, \code{hexdump -C} for the first 64 bytes of any file you are parsing (the ELF magic, the safetensors header length).
+
+\section{Repository layout}
+
+One repository per project (they become six portfolio pieces and six blog posts), all following the same skeleton:
+
+\begin{lstlisting}[style=plain]
+<project>/
+  README.md             what it is, how to build, how to test, headline numbers
+  LICENSE               MIT or Apache-2.0
+  Makefile              targets: all test bench fmt clean; BUILD=debug|release|asan|tsan
+  include/<project>/    public headers (the API specified in this document)
+  src/                  implementation
+  tests/                ck-based unit tests, one file per module; test_*.c
+  bench/                microbenchmarks and measurement scripts
+  scripts/              python3 reference generators, plotting, post-processing
+  docs/                 machine.md, design notes, blog draft (blog.md)
+  .github/workflows/    CI (added in project 6, back-ported to the others)
+  .clang-format         shared style; run `make fmt` before every commit
+  .gitignore            build/, *.o, *.so, *.pdf, data/, __pycache__/
+\end{lstlisting}
+
+Build outputs go to \code{build/\$(BUILD)/} so that debug and sanitizer builds coexist. Model weights and traces live in \code{data/} and are never committed (they belong in \code{.gitignore}); a \code{scripts/fetch\_data.sh} reproduces them.
+
+\section{The test harness \code{ck.h}}
+\label{sec:ck}
+
+Write a single-header unit test framework in project~1 and copy it into every later project. Specification:
+
+\begin{lstlisting}[style=c]
+/* include/ck.h -- minimal C test harness (spec) */
+#define CK_TEST(name)  /* defines `static void name(void)` and registers it */
+#define CK_ASSERT(cond)                   /* fail with file:line and #cond   */
+#define CK_ASSERT_EQ_U64(a, b)            /* prints both values on failure   */
+#define CK_ASSERT_EQ_I64(a, b)
+#define CK_ASSERT_EQ_PTR(a, b)
+#define CK_ASSERT_EQ_STR(a, b)
+#define CK_ASSERT_NEAR(a, b, tol)         /* |a-b| <= tol, prints a, b, |a-b| */
+#define CK_ASSERT_ULP(a, b, n)            /* float a,b within n ULPs (P1 helper) */
+#define CK_SKIP(reason)                   /* mark test skipped, e.g. no F16C   */
+int ck_run_all(int argc, char **argv);    /* --filter=substr, --list, -v       */
+                                           /* returns 0 iff all tests pass     */
+\end{lstlisting}
+
+Design requirements:
+\begin{itemize}
+  \item Registration uses \code{\_\_attribute\_\_((constructor))} so a test file needs no central list. When you reach \csapp\ \ch{7.7}, look at how this works: constructors are function pointers placed in the ELF \code{.init\_array} section (\code{readelf -S} and \code{objdump -s -j .init\_array} on a test binary) and run by the dynamic loader before \code{main}.
+  \item Each test runs in a \code{fork()}ed child (from project~3 onward, once you have read \ch{8.4}); a crashing test then reports ``SIGSEGV in test X'' instead of killing the runner. Until then, run tests in-process.
+  \item \code{CK\_ASSERT\_ULP} compares floats by reinterpreting their bits as signed integers (ordered for finite values of the same sign) and taking the difference; this is itself a chapter~2 exercise.
+  \item The runner's exit code drives \code{make test}, which drives CI in project~6.
+\end{itemize}
+
+\section{Makefile skeleton}
+
+\begin{lstlisting}[style=plain]
+BUILD ?= release
+CC    ?= gcc
+WARN   = -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes -Werror
+ifeq ($(BUILD),debug)    ; CFLAGS = -std=c17 -O0 -g3 $(WARN)
+else ifeq ($(BUILD),asan); CFLAGS = -std=c17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $(WARN)
+else ifeq ($(BUILD),tsan); CFLAGS = -std=c17 -O1 -g -fsanitize=thread $(WARN)
+else                     ; CFLAGS = -std=c17 -O2 -g -fno-omit-frame-pointer -march=native $(WARN)
+endif
+CPPFLAGS = -Iinclude
+OUT  = build/$(BUILD)
+SRC  = $(wildcard src/*.c)
+OBJ  = $(SRC:src/%.c=$(OUT)/%.o)
+TSRC = $(wildcard tests/*.c)
+TBIN = $(OUT)/run_tests
+
+all: $(OUT)/lib<project>.a
+$(OUT)/%.o: src/%.c | $(OUT)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+$(OUT)/lib<project>.a: $(OBJ)
+	ar rcs $@ $^
+$(TBIN): $(TSRC) $(OUT)/lib<project>.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ -lm
+test: $(TBIN) ; $(TBIN) $(ARGS)
+bench: ...   ; fmt: clang-format -i src/*.c include/**/*.h tests/*.c
+clean: ; rm -rf build
+$(OUT): ; mkdir -p $@
+-include $(OBJ:.o=.d)
+\end{lstlisting}
+
+The semicolon-separated \code{ifeq} lines above are shorthand for readability; write them as proper multi-line conditionals. The \code{-MMD -MP} flags generate header dependency files so that editing a header rebuilds what includes it---a small taste of what the linker chapter formalizes.
+
+\section{Documentation conventions}
+
+Every README answers five questions in order: what is this; one headline measurement (a number and a plot); how to build; how to test; how to reproduce the measurement. \code{docs/design.md} records decisions and the alternatives rejected. The blog draft lives at \code{docs/blog.md} and is written \emph{measurement-first}: the post is organized around one figure and the explanation of why it looks the way it does, not around the feature list.
+
+\section{How assignments are specified}
+\label{sec:assignments}
+
+Each project chapter breaks the work into assignments numbered \code{A<project>.<n>}. An assignment has five parts, always in the same order, so that you can tell at a glance whether you are done:
+
+\begin{description}
+  \item[Goal] One or two sentences: what exists at the end that did not exist before.
+  \item[Steps] The order of work. Follow it; the order is chosen so that each step has a test before the next step depends on it.
+  \item[Acceptance] The checklist that must be true before the assignment is closed. Every item is mechanically checkable---a test that passes, a file that exists, a number within a range---because ``it seems to work'' is how bugs survive into the next project.
+  \item[Budget] Hours, assuming 1--2 focused hours per sitting. If you are past $1.5\times$ the budget, stop and write down in \code{docs/design.md} what is harder than expected; that note usually reveals a design mistake worth fixing before continuing. The budgets add up to roughly 55--70 hours per project.
+  \item[Feeds] Which blog section or figure this assignment produces. If an assignment feeds nothing, it is infrastructure; keep it small.
+\end{description}
+
+Assignments close with a commit (or a merged PR from project~4 on) whose message starts with the assignment id, e.g.\ \code{A2.3: quantized matvec via qnum (int8, int4)}. \code{git log --grep=\^{}A2} then lists a project's history by assignment. Keep a \code{docs/log.md} with one dated line per sitting: what you did, what broke, what you measured. It costs two minutes and it is the raw material for the ``what went wrong'' section of each post, which is the section readers remember.
+
+\section{How to write the blog posts}
+\label{sec:blogguide}
+
+Each project yields one main post and one short companion post (the ``b'' post). The briefs in each chapter say what each post argues and which figures it carries; this section says how every post is built, so that the series reads as one body of work.
+
+\subsection{Who the reader is}
+
+Write for a competent engineer or graduate student in ML systems who has not read \csapp\ and has not built the thing. They can read C, know what a cache and a GPU are, and want to leave with (a) one mechanism they now understand from the bottom, (b) one number they can quote, and (c) code they could run. Do not write for the reviewer of your next paper, and do not write for beginners; both audiences are served by the same post if the mechanism is explained from first principles and the numbers are real.
+
+\subsection{The anatomy of a main post (2000--3500 words)}
+
+\begin{enumerate}
+  \item \textbf{Title} ($\le 10$ words): a claim or a question, never a topic. ``A roofline for LLM decode, measured from scratch'' says what you did; ``Notes on CPU inference performance'' says nothing. Subtitle: the single headline number.
+  \item \textbf{Lede} ($\le 120$ words): what you built, the one-sentence result, and why someone working on inference should care. No history of the project, no ``in this post I will''.
+  \item \textbf{The central figure}, in the first screen, with a caption that states the \emph{finding} (``Decode throughput stops improving once weights are 4 bits: the bandwidth ceiling, not the FMA units, sets the limit''), not the axes.
+  \item \textbf{Setup} ($\approx 200$ words): machine (link \code{docs/machine.md}), model and weights, compiler and flags, the Git tag the numbers came from, how many runs and what statistic. Readers who skip this section still trust you more because it is there.
+  \item \textbf{Mechanism} (600--1200 words): the mathematics, \emph{derived}, not quoted. One equation per idea, every symbol defined where it first appears, and a worked numerical example with your machine's numbers right after each equation. If the chapter's math section has a proof (the three-case RNE argument, the online-softmax invariant), the post contains it in full; proofs are what make these posts different from the dozens that paraphrase documentation.
+  \item \textbf{Implementation} (300--600 words): one to three code excerpts of at most 25 lines each, chosen because they show the idea (the RNE expression, the SPSC publish/consume pair, the frame-pointer walk), never for completeness. Each excerpt links to the file at the tagged commit. Describe what the compiler did with it when that is the point (\code{objdump} snippets of $\le 15$ lines).
+  \item \textbf{Results} (400--800 words): the remaining figures, each introduced by what to look at, followed by what it confirms and what surprised you. Report medians with spread and say how many runs. Every speedup appears next to the absolute numbers it came from.
+  \item \textbf{What went wrong} (150--300 words): the bug, the wrong assumption, the measurement that lied. Be specific (``the RoPE pairing convention cost two evenings; the logits matched to $10^{-2}$, which is exactly the signature of a permuted rotary dimension''). This section is the most read and the most linked.
+  \item \textbf{What this predicts elsewhere} (150--300 words): take the mechanism to the GPU, to a FLOPs-poor accelerator, to the serving stack you actually use. Make one falsifiable prediction. This is where the post connects to your research without claiming more than you measured.
+  \item \textbf{Reproduce} (a boxed section): the exact commands, expected wall-clock time, expected output or figure. If it cannot be reproduced from the tagged repo and \code{scripts/fetch\_data.sh}, the post is not finished.
+\end{enumerate}
+
+The companion ``b'' post (1000--1800 words) keeps items 1--3, 5, 8 and 10 and drops the rest; it exists to give one narrow idea a page of its own so it can be linked on its own.
+
+\subsection{Figure standards}
+
+\begin{itemize}
+  \item One message per figure. If you need the word ``and'' to describe what a figure shows, split it.
+  \item Axes labelled with units; log axes whenever the data spans more than two decades (bytes, working-set sizes, latency); the derived bound or model drawn as a dashed line \emph{on the same axes} as the measurement.
+  \item Caption states the finding and names the tag the data came from. Legends inside the plot area only when they do not cover data.
+  \item Colourblind-safe palette (Okabe--Ito or viridis), the same across the whole series; markers distinguish series in addition to colour.
+  \item Export SVG (preferred) or PNG at $2\times$ resolution; width at most the blog's text column. Every figure's data (CSV) and plotting script live in \code{scripts/plots/} in the repo, and the figure file name matches the script name.
+  \item Error bars or shaded spread whenever a point is a statistic over runs; say what the bar is.
+\end{itemize}
+
+\subsection{Writing rules}
+
+\begin{itemize}
+  \item Every claim is measured (with the figure), derived (with the equation), or cited (with the link). No fourth category.
+  \item Past tense for what you did, present tense for what is true. First person singular is fine.
+  \item Explain in the order of ideas, not the order you discovered them; the chronology goes in ``what went wrong''.
+  \item Numbers carry their uncertainty and their conditions (``$38.1 \pm 0.4$ GB/s, single core, 2~MB pages'').
+  \item Never ``simply'', ``just'', ``obviously''. If it were, the post would not be needed.
+  \item Define jargon the first time (TTFT, ULP, PLT). A one-line glossary at the end is better than parentheses throughout.
+  \item Cut the paragraph that explains why the topic is important in general. The lede already did that with a specific reason.
+\end{itemize}
+
+\subsection{Workflow and cadence}
+
+\begin{enumerate}
+  \item At the project's first assignment, write the post's title, thesis, and the central figure's axes into \code{docs/blog.md}. You are writing down a hypothesis; the project will test it.
+  \item As assignments complete, drop figures and ``what went wrong'' notes into the draft the same day. Do not write prose yet.
+  \item When the last measurement assignment closes, write the prose in two sittings: mechanism and implementation first, then results and predictions. Leave it for three days, then read it aloud once and cut 20\%.
+  \item Have one person who did not build it read it; ask only ``where did you stop understanding?'' Fix that place.
+  \item Publish: copy to the blog's \code{\_posts/} with the date, link the Git tag and the \code{reproduce} commands, and add the post to the series index page. Tag the repo \code{blog-<n>} at the exact commit the numbers came from if it differs from the release tag.
+  \item Post the link in one or two places where ML-systems people read (a relevant Discord/Slack, the \code{r/MachineLearning} or Hacker News crowd if the result is strong). Answer every substantive comment; corrections go into the post with a dated note, never silently.
+\end{enumerate}
+
+\subsection{Pre-publication checklist}
+
+\begin{enumerate}
+  \item The central figure appears in the first screen and its caption states a finding.
+  \item Every equation's symbols are defined and at least one has a worked example with real numbers.
+  \item Every number has units, conditions, and (if a statistic) spread.
+  \item Every code excerpt is $\le 25$ lines and links to a tagged file.
+  \item The ``what went wrong'' section names a specific bug or wrong assumption.
+  \item There is one falsifiable prediction about another platform.
+  \item The reproduce box has been executed from a fresh clone on the tagged commit.
+  \item The post links the repo, the tag, \code{docs/machine.md}, and the previous post in the series.
+  \item A reader who skips all prose and reads only figure captions gets the argument.
+  \item The post is under 3500 words (main) or 1800 words (companion) after the 20\% cut.
+\end{enumerate}
+
+\section{Git fundamentals (taught once, used everywhere)}
+\label{sec:gitfund}
+
+The Git lessons in projects 1--6 build on this base. Appendix~\ref{app:git} is the command reference.
+
+\subsection{The object model}
+
+Git is a content-addressed filesystem with a commit graph on top. There are four object types, each identified by the SHA-1 of its contents (SHA-256 repositories exist but are rare):
+
+\begin{description}
+  \item[blob] the bytes of one file, with no name. Two identical files anywhere in history are one blob.
+  \item[tree] a directory: a list of (mode, type, hash, name) entries pointing to blobs and subtrees.
+  \item[commit] a pointer to a root tree, zero or more parent commits, author/committer with timestamps, and a message. A commit's hash therefore covers the entire snapshot and its entire history: change anything and every descendant hash changes.
+  \item[tag] (annotated) a named, signed-able pointer to a commit with a message.
+\end{description}
+
+Objects live in \code{.git/objects/ab/cdef...} (first two hex digits are the directory), zlib-compressed, and are later packed into delta-compressed \emph{packfiles}. Inspect them yourself after your first commit:
+
+\begin{lstlisting}[style=sh]
+git cat-file -p HEAD          # the commit
+git cat-file -p HEAD^{tree}   # its root tree
+git cat-file -p HEAD:src/x.c  # a blob by path
+echo -n 'hello' | git hash-object --stdin   # content addressing by hand
+\end{lstlisting}
+
+\subsection{Refs, HEAD, and the three trees}
+
+A \emph{branch} is a 41-byte file \code{.git/refs/heads/<name>} containing a commit hash; nothing more. \code{HEAD} is a symbolic ref (\code{ref: refs/heads/main}) naming the current branch; a detached HEAD holds a hash directly. Remote-tracking branches \code{refs/remotes/origin/main} record where the remote was at your last fetch.
+
+Three ``trees'' are involved in every command: the \emph{working tree} (your files), the \emph{index} or staging area (\code{.git/index}, the proposed next commit), and \code{HEAD} (the last commit). \code{git add} copies working tree $\to$ index; \code{git commit} snapshots index $\to$ new commit and moves the branch; \code{git diff} compares working tree vs index; \code{git diff --staged} compares index vs HEAD; \code{git restore --staged} copies HEAD $\to$ index; \code{git restore} copies index $\to$ working tree. Every ``how do I undo'' question is answered by naming which of the three you want to change.
+
+\subsection{The baseline workflow}
+
+\begin{lstlisting}[style=sh]
+git config --global user.name "Utkarsh Kumar"
+git config --global user.email "<the email on your GitHub account>"
+git config --global init.defaultBranch main
+git config --global pull.rebase true        # linear history by default
+ssh-keygen -t ed25519 -C "<email>"          # then add ~/.ssh/id_ed25519.pub to GitHub
+ssh -T git@github.com                        # verify
+
+git init qnum && cd qnum
+# ... create skeleton, .gitignore, README ...
+git add -A && git status
+git commit -m "Initial project skeleton"
+gh repo create <user>/qnum --public --source=. --remote=origin --push
+# or: git remote add origin git@github.com:<user>/qnum.git && git push -u origin main
+\end{lstlisting}
+
+\subsection{Commit discipline}
+
+\begin{itemize}
+  \item One logical change per commit; a commit should build and pass tests on its own (project~5 depends on this for \code{git bisect run}).
+  \item Message: imperative subject line $\le 50$ characters (``Add RNE rounding for fp32$\to$bf16''), blank line, body explaining \emph{why} and anything non-obvious, wrapped at 72. The diff already says \emph{what}.
+  \item Stage hunks, not files: \code{git add -p} lets you split one editing session into several coherent commits.
+  \item Never commit generated files, data, or secrets. If you do, see the reflog section in project~3's lesson---but remember that pushed history is public history.
+\end{itemize}

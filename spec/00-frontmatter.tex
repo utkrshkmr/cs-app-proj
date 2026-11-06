@@ -1,0 +1,82 @@
+\chapter*{How to use this document}
+\addcontentsline{toc}{chapter}{How to use this document}
+
+This document specifies six C/C++ projects to build while reading \csapp\ (Bryant \& O'Hallaron, 3rd ed.). The projects are ordered so that each one lands on the chapters you are reading at the time, and they compose: by the end you will have a small CPU-side LLM inference stack whose every layer you wrote and measured yourself---a numerics library, an optimized forward pass, a tracer and profiler, a paged KV-cache with a prefix cache, a tensor JIT, and a continuous-batching server.
+
+Everything that is \emph{not} typing code has been done here: the architecture of each project (directory layout, public headers, data structures, algorithms in pseudocode), the mathematics behind it, the measurements that matter, the test plan, a blog plan per project, and a progressive Git curriculum ending in a CI-tested, versioned, multi-repository release.
+
+\begin{leftto}
+Four things are left to you for every project, and the document is organized so that nothing else is:
+\begin{enumerate}
+  \item \textbf{Implementation} of the specified headers, in C (projects 1--5) or C++20 (project 6).
+  \item \textbf{Testing}: writing the tests enumerated in each ``Test plan'' section and making them pass under the sanitizers.
+  \item \textbf{Documentation}: the README, the \code{docs/} notes, and the blog post whose outline is given.
+  \item \textbf{Pushing}: committing and publishing with the Git workflow taught in that project's Git lesson.
+\end{enumerate}
+\end{leftto}
+
+\section*{Schedule}
+
+Two months per project at 1--2 hours a day, with project~6 allowed to run long. Read the \csapp\ chapters listed \emph{before} the milestones that depend on them; the mapping is deliberate.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}c>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.33\textwidth}lc@{}}
+\toprule
+\# & Project & \csapp\ chapters & Language & Months \\
+\midrule
+1 & \code{qnum} --- low-precision numerics & 2 (bits, IEEE 754), 3 (x86-64 asm) & C & 1--2 \\
+2 & \code{cforward} --- optimized transformer forward pass & 5 (optimization), 6 (memory hierarchy) & C & 3--4 \\
+3 & \code{ltrace-ml} --- interposition tracer + sampling profiler & 7 (linking), 8 (exceptional control flow) & C & 5--6 \\
+4 & \code{pagedkv} --- allocator + paged KV cache + prefix cache & 9 (virtual memory) & C & 7--8 \\
+5 & \code{tinyjit} --- AVX2 JIT for fused tensor ops & 3 (revisit), 7 (relocations, ELF) & C & 9--10 \\
+6 & \code{servlet} --- continuous-batching inference server & 10 (I/O), 11 (network), 12 (concurrency) & C++20 & 11--12 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section*{When to start each project: chapter gates}
+
+The table above says which chapters a project \emph{uses}; this one says when to \emph{start} it. A gate is the reading that must be finished before the first assignment, because the first assignment already depends on it. The remaining chapters of a project's map can be read while its early assignments are under way; the per-assignment gates in the repository's \code{ROADMAP.md} say exactly when. Read \ch{1} before anything and skim \ch{4.1}--4.5 (pipelining) before \ch{5}; neither has a project of its own.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}c>{\raggedright\arraybackslash}p{0.27\textwidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.2\textwidth}@{}}
+\toprule
+\# & Start after (gate) & Read while building & Lab first \\
+\midrule
+1 & \ch{1}, \ch{2} (all) & \ch{3.1}--3.6, \ch{3.11} before A1.6 & Data Lab \\
+2 & \ch{5}, \ch{6.1}--6.7 & \ch{6} rest; A2.1 may begin right after P1 & Cache Lab \\
+3 & \ch{7} (all), \ch{8.1}--8.4 & \ch{8.5} before A3.3; skim \ch{12.3} before A3.4 & Shell Lab \\
+4 & \ch{9} (all) & --- (A4.1 \emph{is} Malloc Lab, done properly) & --- \\
+5 & P4 done; re-read \ch{3.2}--3.7, \ch{3.11} & \ch{7.4}--7.7 again before A5.6 & Bomb/Attack Lab (if skipped) \\
+6 & \ch{10}, \ch{11} & \ch{12} before A6.3 & Proxy Lab (optional) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section*{Conventions used in this document}
+
+\begin{itemize}
+  \item \code{monospace} is a file, command, symbol, or identifier. \ch{6.4} is a \csapp\ section.
+  \item Header listings give the \emph{public} API you must implement; signatures are normative, internal helpers are yours.
+  \item Pseudocode is written to be translated line-for-line; where a detail is left open it is stated as a choice.
+  \item Boxes: \textbf{Research hook} ties the project to your research; \textbf{Blog plan} gives the post to write; \textbf{Git lesson} is the version-control material for that project; \textbf{Pitfall} is a mistake worth avoiding before you make it.
+\end{itemize}
+
+\section*{How the projects compose}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Consumer & Uses \\
+\midrule
+\code{cforward} (P2) & \code{qnum} (P1) for bf16/int8/int4/BFP weights \\
+\code{ltrace-ml} (P3) & \code{cforward} as its first tracing target \\
+\code{pagedkv} (P4) & \code{cforward}'s attention kernel reads from paged blocks \\
+\code{tinyjit} (P5) & replaces \code{cforward}'s elementwise kernels; emits P1's quantize/dequantize ops \\
+\code{servlet} (P6) & \code{cforward} + \code{pagedkv} + \code{qnum} as Git submodules; profiled with \code{ltrace-ml} \\
+\bottomrule
+\end{tabular}
+\end{center}

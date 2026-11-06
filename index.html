@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CS:APP Systems Projects</title>
+<meta name="description" content="Six C/C++ systems projects to build while reading Computer Systems: A Programmer's Perspective, composing into a CPU-side LLM inference stack.">
+<style>
+:root{
+  --bg:#fbfaf7; --surface:#ffffff; --surface-2:#f3f1ec; --text:#1d1c1a; --muted:#5f5b54;
+  --border:#e3dfd6; --accent:#b4531f; --on-accent:#ffffff; --accent-soft:#f7e6db; --code:#2f5d8a; --shadow:0 1px 2px rgba(0,0,0,.04),0 4px 16px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#141413; --surface:#1d1c1a; --surface-2:#262522; --text:#ecebe6; --muted:#a8a49b;
+    --border:#34322e; --accent:#e5824a; --on-accent:#1a120c; --accent-soft:#3a2619; --code:#8fb8e3; --shadow:none;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#141413; --surface:#1d1c1a; --surface-2:#262522; --text:#ecebe6; --muted:#a8a49b;
+  --border:#34322e; --accent:#e5824a; --on-accent:#1a120c; --accent-soft:#3a2619; --code:#8fb8e3; --shadow:none;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}
+code{color:var(--code)}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+.wrap{max-width:980px;margin:0 auto;padding:0 20px}
+header.top{display:flex;justify-content:space-between;align-items:center;padding:18px 0;border-bottom:1px solid var(--border)}
+.brand{font-weight:700;letter-spacing:-.01em}
+.brand span{color:var(--accent)}
+.toggle{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:6px 14px;font:inherit;font-size:.9rem;cursor:pointer}
+.hero{padding:56px 0 32px}
+.hero h1{font-size:clamp(1.9rem,4.5vw,2.8rem);line-height:1.15;letter-spacing:-.02em;margin:0 0 14px}
+.hero p{font-size:1.1rem;color:var(--muted);max-width:720px;margin:0 0 20px}
+.btns{display:flex;flex-wrap:wrap;gap:10px}
+.btn{display:inline-block;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);text-decoration:none;font-weight:600;font-size:.95rem}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+section{padding:28px 0}
+h2{font-size:1.45rem;letter-spacing:-.01em;margin:0 0 6px}
+.lead{color:var(--muted);margin:0 0 20px}
+.stack{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin:8px 0 6px}
+.layer{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 10px;text-align:center;box-shadow:var(--shadow)}
+.layer b{display:block;font-family:ui-monospace,Menlo,monospace;font-size:.92rem}
+.layer small{color:var(--muted);font-size:.78rem;line-height:1.3;display:block;margin-top:4px}
+.layer .n{color:var(--accent);font-weight:700;font-size:.75rem;letter-spacing:.06em}
+.flow{color:var(--muted);font-size:.9rem;margin:10px 0 0}
+.tl{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.93rem}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+th{background:var(--surface-2);font-weight:600;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+tr:last-child td{border-bottom:0}
+.pill{display:inline-block;background:var(--accent-soft);color:var(--accent);border-radius:999px;padding:1px 9px;font-size:.78rem;font-weight:600;white-space:nowrap}
+.cards{display:grid;gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:var(--shadow)}
+.card-head{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:baseline;justify-content:space-between}
+.card h3{margin:0;font-size:1.2rem}
+.card h3 .n{color:var(--accent);margin-right:6px}
+.meta{display:flex;flex-wrap:wrap;gap:6px}
+.card p{margin:10px 0}
+.gate{background:var(--surface-2);border-radius:8px;padding:10px 12px;font-size:.92rem;margin:12px 0}
+.gate b{color:var(--accent)}
+.why{color:var(--muted);font-size:.95rem}
+details{margin-top:12px;border-top:1px solid var(--border);padding-top:10px}
+summary{cursor:pointer;font-weight:600;font-size:.95rem}
+details ul{margin:8px 0 0;padding-left:20px}
+details li{margin:4px 0}
+.asg{width:100%;margin-top:10px;font-size:.88rem}
+.asg td:first-child{font-family:ui-monospace,Menlo,monospace;white-space:nowrap;color:var(--accent)}
+.asg td:nth-child(3){white-space:nowrap;color:var(--muted)}
+.links{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;font-size:.92rem}
+.left{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.left div{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+.left b{display:block;margin-bottom:4px}
+.left span{color:var(--muted);font-size:.9rem}
+footer{border-top:1px solid var(--border);padding:24px 0 40px;color:var(--muted);font-size:.88rem;margin-top:24px}
+@media (max-width:760px){
+  .stack{grid-template-columns:repeat(2,1fr)}
+  .left{grid-template-columns:1fr 1fr}
+  .wrap{padding:0 16px}
+  .hero{padding:36px 0 20px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">cs-app-<span>proj</span></div>
+    <button class="toggle" id="themeToggle" type="button" aria-label="Toggle color theme">Toggle theme</button>
+  </header>
+
+  <div class="hero">
+    <h1>Six systems projects to build while reading CS:APP</h1>
+    <p>Each project lands on the chapters you're reading at the time, and together they compose into a small CPU-side LLM inference stack — numerics, an optimized forward pass, a tracer, a paged KV cache, a JIT, and a continuous-batching server — where you wrote and measured every layer.</p>
+    <div class="btns">
+      <a class="btn primary" href="https://github.com/utkrshkmr/cs-app-proj/blob/main/ROADMAP.md">Roadmap: when to start what</a>
+      <a class="btn" href="spec/csapp_six_projects.pdf">Full spec (PDF, 89 pp.)</a>
+      <a class="btn" href="https://github.com/utkrshkmr/cs-app-proj">GitHub</a>
+    </div>
+  </div>
+
+  <section>
+    <h2>The stack you end up with</h2>
+    <p class="lead">Built bottom-up, in reading order. Each layer reuses the ones before it.</p>
+    <div class="stack">
+      <div class="layer"><span class="n">P1</span><b>qnum</b><small>number formats &amp; rounding</small></div>
+      <div class="layer"><span class="n">P2</span><b>cforward</b><small>forward pass on a roofline</small></div>
+      <div class="layer"><span class="n">P3</span><b>ltrace-ml</b><small>tracer &amp; profiler</small></div>
+      <div class="layer"><span class="n">P4</span><b>pagedkv</b><small>allocator &amp; KV cache</small></div>
+      <div class="layer"><span class="n">P5</span><b>tinyjit</b><small>AVX2 kernel JIT</small></div>
+      <div class="layer"><span class="n">P6</span><b>servlet</b><small>batching server</small></div>
+    </div>
+    <p class="flow"><code>cforward</code> loads <code>qnum</code> weights · <code>ltrace-ml</code> traces <code>cforward</code> · <code>pagedkv</code> feeds its attention · <code>tinyjit</code> replaces its elementwise kernels · <code>servlet</code> pulls them in as submodules.</p>
+  </section>
+
+  <section>
+    <h2>When to attack each project</h2>
+    <p class="lead">Finish the <em>gate</em> before the first assignment; read the rest while building. Read Ch. 1 first and skim Ch. 4.1–4.5 before Ch. 5.</p>
+    <div class="tl">
+      <table>
+        <thead><tr><th>#</th><th>Project</th><th>Start after</th><th>Read while building</th><th>Lab first</th><th>Months</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td><code>qnum</code></td><td>Ch. 1–2</td><td>§3.1–3.6, 3.11 before A1.6</td><td>Data Lab</td><td>1–2</td></tr>
+          <tr><td>2</td><td><code>cforward</code></td><td>Ch. 5, §6.1–6.7</td><td>rest of Ch. 6 (A2.1 can start right after P1)</td><td>Cache Lab</td><td>3–4</td></tr>
+          <tr><td>3</td><td><code>ltrace-ml</code></td><td>Ch. 7, §8.1–8.4</td><td>§8.5 before A3.3; skim §12.3 before A3.4</td><td>Shell Lab</td><td>5–6</td></tr>
+          <tr><td>4</td><td><code>pagedkv</code></td><td>Ch. 9 (all)</td><td>— (A4.1 <em>is</em> Malloc Lab)</td><td>—</td><td>7–8</td></tr>
+          <tr><td>5</td><td><code>tinyjit</code></td><td>P4 done + re-read §3.2–3.7, 3.11</td><td>§7.4–7.7 again before A5.6</td><td>Bomb/Attack</td><td>9–10</td></tr>
+          <tr><td>6</td><td><code>servlet</code></td><td>Ch. 10–11</td><td>Ch. 12 before A6.3</td><td>Proxy (opt.)</td><td>11–12</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>The projects</h2>
+    <p class="lead">Each card: what you build, the reading gate, why it matters, and the assignments with budgets.</p>
+    <div class="cards">
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P1</span><code>qnum</code> — low-precision numerics</h3>
+          <div class="meta"><span class="pill">C</span><span class="pill">≈54 h</span><span class="pill">Ch. 2–3</span></div></div>
+        <p>A C library for fp16, bf16, fp8 (E4M3/E5M2), int8/int4 group quantization and block floating point, with every conversion written as integer bit manipulation: round-to-nearest-even, truncation and stochastic rounding; subnormals, NaN, Inf and saturation handled exactly; and SQNR measured on real model weights.</p>
+        <div class="gate"><b>Start after</b> Ch. 1–2 and Data Lab. Read §3.1–3.6 and §3.11 before the assembly study (A1.6).</div>
+        <p class="why">Why: KV-cache compression, weight quantization and accelerator formats (BFP, fp8, micro-scaled fp4) all reduce to these bit tricks — and it's where compiler/ISA differences first show up in numbers.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>RNE with integers: add <code>2^(d−1) − 1 + lsb</code>, then shift; carry into the exponent is a feature.</li>
+            <li>Float bit patterns are monotone as integers → ULP distance and exhaustive testing are cheap.</li>
+            <li>Integer quantization costs <code>B + 16/g</code> bits/weight; BFP loses one bit per octave below the block max.</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A1.1</td><td>Repository, test harness, Makefile</td><td>6 h</td></tr>
+            <tr><td>A1.2</td><td>fp16 &amp; bf16, three rounding modes</td><td>12 h</td></tr>
+            <tr><td>A1.3</td><td>fp8 E4M3 &amp; E5M2</td><td>8 h</td></tr>
+            <tr><td>A1.4</td><td>int8/int4 group quantization + BFP</td><td>10 h</td></tr>
+            <tr><td>A1.5</td><td>Measurement suite on a real checkpoint</td><td>10 h</td></tr>
+            <tr><td>A1.6</td><td>Assembly study + 2³² sweep vs F16C</td><td>8 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “Every inference number format, from the bits up” · “Verifying a float converter against every one of the four billion inputs”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/01-qnum/README.md">Project README →</a></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P2</span><code>cforward</code> — optimized transformer forward pass</h3>
+          <div class="meta"><span class="pill">C</span><span class="pill">≈60 h</span><span class="pill">Ch. 5–6</span></div></div>
+        <p>A llama2.c-style forward pass (RMSNorm, RoPE, GQA attention, SwiGLU) that matches reference logits, then is optimized one technique at a time — loop order, cache blocking, AVX2, multiple accumulators, quantized weights — with every step plotted on a roofline whose ceilings you measured via the memory mountain.</p>
+        <div class="gate"><b>Start after</b> Ch. 5 and §6.1–6.7 (Cache Lab). The reference pass (A2.1) can begin right after P1.</div>
+        <p class="why">Why: prefill is compute-bound, decode is bandwidth-bound — here you derive it, measure it, and see what 4-bit weights do to the decode ceiling.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>One accumulator is bounded by FMA latency; <code>k</code> independent ones approach throughput (§5.7).</li>
+            <li>Tile for L1/L2; derive the miss counts (§6.6).</li>
+            <li>Online softmax: one pass, a running max, a rescaled sum — one invariant.</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A2.0</td><td>Memory mountain, peak FLOP/s &amp; bandwidth, roofline</td><td>8 h</td></tr>
+            <tr><td>A2.1</td><td>Reference forward pass</td><td>14 h</td></tr>
+            <tr><td>A2.2</td><td>The matvec ladder R1–R4</td><td>10 h</td></tr>
+            <tr><td>A2.3</td><td>Quantized weights via qnum</td><td>10 h</td></tr>
+            <tr><td>A2.4</td><td>Online-softmax attention + prefill GEMM</td><td>12 h</td></tr>
+            <tr><td>A2.5</td><td>Hardware counters</td><td>6 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “A roofline for LLM decode, measured from scratch on one CPU core” · “Online softmax, explained with one invariant”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/02-cforward/README.md">Project README →</a></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P3</span><code>ltrace-ml</code> — interposition tracer &amp; sampling profiler</h3>
+          <div class="meta"><span class="pill">C</span><span class="pill">≈55 h</span><span class="pill">Ch. 7–8</span></div></div>
+        <p>An <code>LD_PRELOAD</code> library that intercepts <code>malloc</code>/<code>free</code> and then the CUDA runtime, logging sizes, timings and call stacks cheaply enough to run under PyTorch; a <code>SIGPROF</code> profiler emitting flame graphs; a <code>fork</code>/<code>exec</code> launcher; and an offline symbolizer.</p>
+        <div class="gate"><b>Start after</b> Ch. 7 and §8.1–8.4 (Shell Lab). Read §8.5 before the profiler (A3.3).</div>
+        <p class="why">Why: a reusable measurement tool for serving and compiler papers, and the linker/signal machinery that Nsight and CUPTI stand on.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>Preloaded objects win symbol lookup; <code>dlsym(RTLD_NEXT)</code> finds the real function.</li>
+            <li>Reentrancy guards and a bump arena keep hooks from recursing into themselves.</li>
+            <li>Sampling is statistics: share ± 1.96·√(p(1−p)/n).</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A3.1</td><td>Allocation hooks + launcher</td><td>10 h</td></tr>
+            <tr><td>A3.2</td><td>Stack walking; LD_PRELOAD vs --wrap</td><td>8 h</td></tr>
+            <tr><td>A3.3</td><td>Sampling profiler</td><td>10 h</td></tr>
+            <tr><td>A3.4</td><td>Threads</td><td>8 h</td></tr>
+            <tr><td>A3.5</td><td>CUDA runtime interposition</td><td>10 h</td></tr>
+            <tr><td>A3.6</td><td>Overhead study</td><td>5 h</td></tr>
+            <tr><td>A3.7</td><td>Stretch: profile a WRF binary</td><td>4 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “What does PyTorch actually ask the CUDA runtime for?” · “A sampling profiler is a statistics problem”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/03-ltrace-ml/README.md">Project README →</a></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P4</span><code>pagedkv</code> — allocator, paged KV cache, prefix cache</h3>
+          <div class="meta"><span class="pill">C</span><span class="pill">≈64 h</span><span class="pill">Ch. 9</span></div></div>
+        <p>Malloc Lab done to completion, then a vLLM-style KV manager on <code>mmap</code>'d memory: fixed blocks, block tables, refcounts with copy-on-write, a radix tree for prefix caching, pluggable eviction, a disk tier — plus reuse-distance analysis that measures every policy against Belady's optimal.</p>
+        <div class="gate"><b>Start after</b> all of Ch. 9. The allocator (A4.1) replaces Malloc Lab.</div>
+        <p class="why">Why: it's the data structure behind PagedAttention and RadixAttention, and it asks the OS question — how far is LRU from optimal — for KV blocks.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>Mattson: one reuse-distance histogram gives LRU's miss ratio for every cache size.</li>
+            <li>Belady's MIN evicts the block used furthest in the future; tree structure forces leaf-first eviction.</li>
+            <li>TLB reach with 4 KB vs 2 MB pages, measured on attention gathers.</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A4.1</td><td>The allocator</td><td>14 h</td></tr>
+            <tr><td>A4.2</td><td>Block pool, pages and the TLB</td><td>10 h</td></tr>
+            <tr><td>A4.3</td><td>Block tables, fork, copy-on-write</td><td>8 h</td></tr>
+            <tr><td>A4.4</td><td>Radix tree + eviction policies</td><td>10 h</td></tr>
+            <tr><td>A4.5</td><td>Reuse distance, OPT, working set</td><td>12 h</td></tr>
+            <tr><td>A4.6</td><td>Cold tier + paged attention</td><td>10 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “Paging a KV cache on a CPU: what the TLB thinks of PagedAttention” · “Belady's MIN for KV blocks: how far is LRU from optimal?”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/04-pagedkv/README.md">Project README →</a></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P5</span><code>tinyjit</code> — AVX2 JIT for fused tensor ops</h3>
+          <div class="meta"><span class="pill">C</span><span class="pill">≈58 h</span><span class="pill">Ch. 3, 7 (revisit)</span></div></div>
+        <p>A tensor-expression IR compiled at run time to AVX2 machine code: operator fusion, linear-scan register allocation over 16 <code>ymm</code> registers, a masked tail, a RIP-relative constant pool, and optionally a relocatable ELF <code>.o</code> that <code>gcc</code> links.</p>
+        <div class="gate"><b>Start after</b> P4, with a second pass through §3.2–3.7 and §3.11. Re-read §7.4–7.7 before the ELF stretch (A5.6).</div>
+        <p class="why">Why: it's the last mile of every DL compiler — DAG → loop → bytes — with nothing between you and the numbers.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>VEX/ModR/M/SIB encoding, golden-tested byte-for-byte against <code>as</code>.</li>
+            <li>W⊕X: write, then <code>mprotect</code> to execute.</li>
+            <li>Fusing <code>k</code> elementwise ops saves ≈ <code>k×</code> memory traffic on a bandwidth-bound loop.</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A5.1</td><td>Encoder vs assembler goldens</td><td>10 h</td></tr>
+            <tr><td>A5.2</td><td>IR, interpreter, first kernel</td><td>8 h</td></tr>
+            <tr><td>A5.3</td><td>Register allocation, masked tail, fuzzing</td><td>12 h</td></tr>
+            <tr><td>A5.4</td><td>Transcendentals + fusion benchmark</td><td>12 h</td></tr>
+            <tr><td>A5.5</td><td>Integer ops + quantizer kernels</td><td>8 h</td></tr>
+            <tr><td>A5.6</td><td>Stretch: relocatable ELF object</td><td>8 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “An AVX2 JIT for fused tensor ops in 2000 lines of C” · “How I test a code generator”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/05-tinyjit/README.md">Project README →</a></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head"><h3><span class="n">P6</span><code>servlet</code> — continuous-batching inference server</h3>
+          <div class="meta"><span class="pill">C++20</span><span class="pill">≈80 h</span><span class="pill">Ch. 10–12</span></div></div>
+        <p>An <code>epoll</code> HTTP/1.1 server streaming tokens over SSE, with an engine thread, lock-free queues, and an iteration-level scheduler doing chunked prefill, KV-aware admission, preemption and prefix-affinity batching — measured with a load generator for TTFT, TPOT and goodput, TSan-clean, with CI and submodules.</p>
+        <div class="gate"><b>Start after</b> Ch. 10–11 (Proxy Lab optional). Read Ch. 12 before the engine thread (A6.3).</div>
+        <p class="why">Why: a testbed for scheduling and caching ideas where every queue and lock is yours, before you touch vLLM or SGLang.</p>
+        <details><summary>Key ideas &amp; assignments</summary>
+          <ul>
+            <li>Short counts are normal; buffers and backpressure make them safe.</li>
+            <li>Parser correctness = any split of the bytes parses identically.</li>
+            <li>Step time ≈ <code>t_w + B·t_tok</code>: batching amortizes the weight read until KV or compute binds.</li>
+          </ul>
+          <table class="asg"><tbody>
+            <tr><td>A6.1</td><td>Reactor, buffers, parser, static endpoint</td><td>14 h</td></tr>
+            <tr><td>A6.2</td><td>Tokenizer + single completion</td><td>8 h</td></tr>
+            <tr><td>A6.3</td><td>Engine thread, queues, SSE streaming</td><td>12 h</td></tr>
+            <tr><td>A6.4</td><td>Continuous batching, chunked prefill</td><td>14 h</td></tr>
+            <tr><td>A6.5</td><td>Preemption + prefix-affinity scheduling</td><td>10 h</td></tr>
+            <tr><td>A6.6</td><td>Load generator + latency–load study</td><td>12 h</td></tr>
+            <tr><td>A6.7</td><td>CI, releases, submodules</td><td>10 h</td></tr>
+          </tbody></table>
+          <ul><li><b>Posts:</b> “Continuous batching from first principles” · “Finding data races with ThreadSanitizer, and the one it could not see”</li></ul>
+        </details>
+        <div class="links"><a href="https://github.com/utkrshkmr/cs-app-proj/blob/main/projects/06-servlet/README.md">Project README →</a></div>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>What's left to you</h2>
+    <p class="lead">The spec covers architecture, math, headers, pseudocode, test plans and blog briefs. Four things remain:</p>
+    <div class="left">
+      <div><b>Implement</b><span>the specified headers — C for P1–P5, C++20 for P6.</span></div>
+      <div><b>Test</b><span>every item in each test plan, green under the sanitizers.</span></div>
+      <div><b>Document</b><span>README, <code>docs/</code>, and two blog posts per project.</span></div>
+      <div><b>Push</b><span>with a Git workflow that escalates from first commit to CI and releases.</span></div>
+    </div>
+  </section>
+
+  <footer>
+    utkrshkmr · Built around <em>Computer Systems: A Programmer's Perspective</em> (Bryant &amp; O'Hallaron, 3rd ed.) · ~9 h/week, 12 months.
+  </footer>
+</div>
+<script>
+(function(){
+  var root=document.documentElement, btn=document.getElementById('themeToggle');
+  try{var saved=localStorage.getItem('theme'); if(saved) root.setAttribute('data-theme',saved);}catch(e){}
+  btn.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme');
+    if(!cur){cur=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}
+    var next=cur==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('theme',next);}catch(e){}
+  });
+})();
+</script>
+</body>
+</html>
